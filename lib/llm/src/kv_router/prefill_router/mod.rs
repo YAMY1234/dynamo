@@ -128,6 +128,18 @@ impl
             ));
         }
 
+        // Track the DP rank chosen by the prefill router so we can also stamp
+        // it onto the *decode-phase* request below. Without this, only the
+        // (cloned) prefill_req carries the value, and the decode handler reads
+        // `routing.prefill_dp_rank == None` and falls back to `routing.dp_rank`
+        // (which, by the time decode_handler runs, is the decode router's pick
+        // — see `push_router.rs` decode-phase `routing_mut().dp_rank = ...`).
+        // SGLang's `MooncakeKVReceiver` consumes that value as `prefill_dp_rank`
+        // for its bootstrap-server lookup, so handing it the decode DP rank
+        // `KeyError`s the prefill `prefill_port_table` whenever
+        // `prefill_dp_size != decode_dp_size`.
+        let mut chosen_prefill_dp_rank: Option<u32> = None;
+
         let prefill_result = match self
             .resolve_prefill_worker(&prefill_req, preselected_worker)
             .await
@@ -145,6 +157,8 @@ impl
                 {
                     router.select_next_worker();
                 }
+
+                chosen_prefill_dp_rank = dp_rank;
 
                 let routing = prefill_req.routing_mut();
                 routing.prefill_worker_id = Some(worker_id);
@@ -234,6 +248,21 @@ impl
                 }
 
                 let mut decode_req = req;
+
+                // Carry the prefill router's chosen DP rank into the decode-
+                // phase request so the decode handler can forward it to the
+                // backend (SGLang reads `data_parallel_rank` as the prefill
+                // DP rank for its bootstrap lookup in disagg mode — see
+                // sgl-project/sglang#10169 / #19168). The earlier
+                // `prefill_req.routing.prefill_dp_rank = ...` write only lands
+                // on the cloned prefill request that gets spawned to the
+                // prefill backend; without copying it onto `decode_req` here,
+                // `decode_handler.py` reads `routing.prefill_dp_rank == None`
+                // and falls back to `routing.dp_rank`, which by the time the
+                // decode `PushRouter` has run is the *decode* DP rank.
+                if chosen_prefill_dp_rank.is_some() {
+                    decode_req.routing_mut().prefill_dp_rank = chosen_prefill_dp_rank;
+                }
 
                 match outcome {
                     PrefillOutcome::Bootstrap(info) => {
