@@ -148,7 +148,19 @@ impl
 
                 let routing = prefill_req.routing_mut();
                 routing.prefill_worker_id = Some(worker_id);
-                routing.dp_rank = dp_rank;
+                // Write the prefill router's chosen DP rank into the dedicated
+                // `prefill_dp_rank` field rather than the generic `dp_rank`
+                // (which is the *decode* DP rank slot and gets overwritten by
+                // the decode-side `PushRouter` before the request reaches the
+                // worker). Without this, the prefill DP rank picked by the KV
+                // router (and encoded into `bootstrap_room` by
+                // `compute_bootstrap_room`) is silently lost between phases,
+                // and SGLang's decode-side `MooncakeKVReceiver` ends up
+                // querying the prefill bootstrap server with the *decode*
+                // DP rank as `target_dp_group`, which `KeyError`s out of the
+                // single-node prefill `prefill_port_table` for any rank
+                // outside `[0, prefill_dp_size)`.
+                routing.prefill_dp_rank = dp_rank;
                 prefill_req.bootstrap_info = Some(bootstrap_info.clone());
 
                 // NVBugs 5969206: Do NOT link prefill as child of engine context.

@@ -133,7 +133,13 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         input_param = self._get_input_param(inner_request)
         routing = inner_request.get("routing") or {}
         priority = routing.get("priority")
-        dp_rank = routing.get("dp_rank")
+        # The prefill router writes its chosen DP rank into `prefill_dp_rank`
+        # (see `PrefillRouter::resolve_prefill_worker`); fall back to the
+        # legacy `dp_rank` field for compatibility with older frontends that
+        # have not picked up that fix yet.
+        dp_rank = routing.get("prefill_dp_rank")
+        if dp_rank is None:
+            dp_rank = routing.get("dp_rank")
 
         if dp_rank is not None and dp_rank == _DP_RANK_UNSET:
             dp_rank = None

@@ -329,9 +329,18 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
             trace_header = build_trace_headers(context) if self.enable_trace else None
 
-            # Extract dp_rank from routing info (set by KV router)
+            # In disaggregated mode, SGLang's decode-side `MooncakeKVReceiver`
+            # interprets `data_parallel_rank` as the *prefill* DP rank (see
+            # `python/sglang/srt/disaggregation/decode.py`'s
+            # `prefill_dp_rank=req.data_parallel_rank` and PR sgl-project/sglang#10169).
+            # Read from the dedicated `prefill_dp_rank` routing slot (written
+            # by `PrefillRouter::resolve_prefill_worker`); fall back to
+            # `dp_rank` for older frontends that have not picked up the
+            # prefill_router fix yet.
             routing = request.get("routing") or {}
-            dp_rank = routing.get("dp_rank")
+            dp_rank = routing.get("prefill_dp_rank")
+            if dp_rank is None:
+                dp_rank = routing.get("dp_rank")
 
             decode = await self.engine.async_generate(
                 **input_param,
