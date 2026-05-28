@@ -1207,6 +1207,7 @@ async fn chat_completions(
             request.inner.max_completion_tokens = Some(template.max_completion_tokens);
         }
     }
+    request.normalize_reasoning_template_args();
 
     // Capture the resolved model after template application for metrics and engine lookup
     // todo - make the protocols be optional for model name

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use dynamo_runtime::protocols::annotated::AnnotationsProvider;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -53,6 +55,11 @@ pub struct NvCreateChatCompletionRequest {
     )]
     pub chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
 
+    /// OpenAI-style thinking control from clients such as AgentPerf/RWLT.
+    /// Normalized into `chat_template_args.thinking` before preprocessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
+
     /// Runtime media decoding parameters.
     /// When provided, these override the MDC defaults
     /// Example: `{"video": {"num_frames": 16}}`
@@ -62,6 +69,45 @@ pub struct NvCreateChatCompletionRequest {
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
     pub unsupported_fields: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl NvCreateChatCompletionRequest {
+    /// Normalize OpenAI-style DS-V4 reasoning controls into the template kwargs
+    /// consumed by the SGLang/DeepSeek-V4 prompt formatter.
+    pub fn normalize_reasoning_template_args(&mut self) {
+        let thinking_enabled = self.thinking.as_ref().and_then(openai_thinking_enabled);
+        let reasoning_effort = self
+            .inner
+            .reasoning_effort
+            .as_ref()
+            .and_then(|effort| serde_json::to_value(effort).ok());
+
+        if thinking_enabled.is_none() && reasoning_effort.is_none() {
+            return;
+        }
+
+        let args = self.chat_template_args.get_or_insert_with(HashMap::new);
+        if let Some(enabled) = thinking_enabled {
+            args.entry("thinking".to_string())
+                .or_insert(serde_json::Value::Bool(enabled));
+        }
+        if let Some(effort) = reasoning_effort {
+            args.entry("reasoning_effort".to_string()).or_insert(effort);
+        }
+    }
+}
+
+fn openai_thinking_enabled(value: &serde_json::Value) -> Option<bool> {
+    if let Some(enabled) = value.as_bool() {
+        return Some(enabled);
+    }
+
+    let thinking_type = value.get("type").and_then(|v| v.as_str())?;
+    match thinking_type {
+        "enabled" => Some(true),
+        "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 /// A response structure for unary chat completion responses, embedding OpenAI's
@@ -425,5 +471,28 @@ mod tests {
 
             assert_eq!(output_options.skip_special_tokens, Some(skip_value));
         }
+    }
+
+    #[test]
+    fn test_openai_thinking_payload_normalizes_to_template_args() {
+        let json_str = json!({
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "reasoning_effort": "max",
+            "thinking": {"type": "enabled"}
+        });
+
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        request.normalize_reasoning_template_args();
+
+        let args = request
+            .chat_template_args
+            .as_ref()
+            .expect("chat_template_args should be populated");
+        assert_eq!(args.get("thinking"), Some(&json!(true)));
+        assert_eq!(args.get("reasoning_effort"), Some(&json!("max")));
     }
 }
