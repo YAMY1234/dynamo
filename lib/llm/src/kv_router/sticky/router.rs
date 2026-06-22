@@ -245,6 +245,14 @@ impl AffinityStore for InMemoryAffinityStore {
 /// Wraps an [`AffinityStore`] and provides session-id-level affinity helpers.
 pub struct StickySessionRouter {
     store: Box<dyn AffinityStore>,
+    /// Last Layer-2 rebind time per session, used by [`Self::in_rebind_cooldown`]
+    /// to throttle thrash. Kept as a side-map (rather than a field on
+    /// `AffinityEntry`) so it does not touch the entry's `Eq`/serde contract.
+    /// Entries are best-effort: a session that expires from `store` leaves a
+    /// stale timestamp here that is overwritten on the next rebind; this never
+    /// resurrects affinity, only gates a future rebind, so no separate reaper
+    /// is required.
+    last_rebind: DashMap<String, Instant>,
 }
 
 impl StickySessionRouter {
@@ -252,6 +260,7 @@ impl StickySessionRouter {
         tracing::debug!("StickySessionRouter initialized");
         StickySessionRouter {
             store: Box::new(store),
+            last_rebind: DashMap::new(),
         }
     }
 
@@ -282,6 +291,47 @@ impl StickySessionRouter {
             "Binding session affinity"
         );
         self.store.put(session_id, worker, ttl, kind)
+    }
+
+    /// Rebind a session to a colder `(worker, dp_rank)`, returning the OLD
+    /// (hot) target so the caller can build a `migrate_from` directive.
+    /// Last-write-wins over [`Self::bind`] (same `store.put` primitive);
+    /// preserves the caller-chosen `kind`/`ttl`. Stamps `last_rebind` so
+    /// [`Self::in_rebind_cooldown`] can throttle subsequent rebinds.
+    ///
+    /// NOTE: peek-then-put is not atomic across the two calls; this is
+    /// acceptable for the single in-memory router (see module doc) where the
+    /// rebind decision is itself serialized on the routing path.
+    pub fn rebind(
+        &self,
+        session_id: &str,
+        cold: WorkerWithDpRank,
+        ttl: Duration,
+        kind: AffinityKind,
+    ) -> (Option<WorkerWithDpRank>, AffinityBindingToken) {
+        let old = self.store.peek(session_id);
+        let token = self.store.put(session_id, cold, ttl, kind);
+        self.last_rebind
+            .insert(session_id.to_owned(), Instant::now());
+        tracing::info!(
+            %session_id,
+            old_worker_id = old.map(|w| w.worker_id),
+            old_dp_rank = old.map(|w| w.dp_rank),
+            new_worker_id = cold.worker_id,
+            new_dp_rank = cold.dp_rank,
+            kind = ?kind,
+            "Sticky rebind: moving session to colder dp_rank"
+        );
+        (old, token)
+    }
+
+    /// Returns true if this session was rebound less than `cooldown` ago.
+    /// Used by the Layer-2 trigger to avoid rebind thrash.
+    pub fn in_rebind_cooldown(&self, session_id: &str, cooldown: Duration) -> bool {
+        self.last_rebind
+            .get(session_id)
+            .map(|last| last.elapsed() < cooldown)
+            .unwrap_or(false)
     }
 
     /// Remove a session binding.
@@ -387,6 +437,57 @@ mod tests {
         assert_eq!(entry.ttl, Duration::from_secs(90));
         assert_eq!(entry.kind, AffinityKind::RouterOnly);
         assert!(entry.expires_at > Instant::now() + Duration::from_secs(80));
+    }
+
+    #[test]
+    fn rebind_same_worker_different_dp_rank_is_not_dropped() {
+        // The exact case G3 feared: rebinding within the SAME worker to a
+        // different dp_rank must overwrite the binding, not be silently
+        // dropped. Returns the OLD target for migrate_from.
+        let map = Arc::new(DashMap::new());
+        let store = InMemoryAffinityStore {
+            map: map.clone(),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+        router.bind(
+            "sess-1",
+            worker(42, 3),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+
+        let (old, _token) = router.rebind(
+            "sess-1",
+            worker(42, 7),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+
+        assert_eq!(old, Some(worker(42, 3)));
+        assert_eq!(router.peek_session("sess-1"), Some(worker(42, 7)));
+        assert_eq!(map.get("sess-1").unwrap().worker, worker(42, 7));
+    }
+
+    #[test]
+    fn rebind_records_cooldown() {
+        let store = InMemoryAffinityStore {
+            map: Arc::new(DashMap::new()),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+        assert!(!router.in_rebind_cooldown("sess-1", Duration::from_secs(5)));
+
+        router.rebind(
+            "sess-1",
+            worker(1, 0),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+
+        assert!(router.in_rebind_cooldown("sess-1", Duration::from_secs(5)));
+        // A zero cooldown never gates.
+        assert!(!router.in_rebind_cooldown("sess-1", Duration::from_secs(0)));
     }
 
     #[test]

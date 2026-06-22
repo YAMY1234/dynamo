@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
@@ -23,6 +24,7 @@ use crate::{
     preprocessor::PreprocessedRequest,
     protocols::common::{
         llm_backend::LLMEngineOutput,
+        preprocessor::MigrateFrom,
         timing::{RequestPhase, RoutingData},
     },
 };
@@ -34,6 +36,15 @@ mod selection;
 use cancellation::{cancel_on_stop, cancelled_error};
 use request_guard::RequestGuard;
 use selection::{RoutingRequestParts, WorkerSelection};
+
+/// Layer-2 rebind hysteresis: the hot rank's potential prefill tokens must
+/// exceed the coldest rank's by more than this before a rebind fires.
+const REBIND_HYSTERESIS_TOKENS: usize = 4096;
+/// Minimum interval between rebinds of the same session, to avoid thrash.
+const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
+/// Fallback TTL for a rebind when the request carries no session_control
+/// timeout (in practice sticky gating guarantees one is present).
+const REBIND_DEFAULT_TTL: Duration = Duration::from_secs(300);
 
 pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
@@ -350,6 +361,88 @@ impl KvPushRouter {
         Ok(ResponseStream::new(wrapped_stream, stream_context))
     }
 
+    /// Layer-2 KV-migration: if the sticky-pinned (hot) rank is overloaded
+    /// relative to the coldest eligible rank, rebind the session to the cold
+    /// rank and return `(old_hot, cold)` so the caller can redirect the
+    /// dispatch and inject `migrate_from`. Returns `None` when no rebind fires
+    /// (non-prefill phase, no sticky session, within hysteresis, or in
+    /// cooldown).
+    ///
+    /// Runs on the LIVE prefill path (`select_and_dispatch_prefill`), the only
+    /// place with both `self.sticky` and `self.chooser` load data in scope.
+    async fn check_and_trigger_rebind(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        hot: WorkerWithDpRank,
+    ) -> Option<(WorkerWithDpRank, WorkerWithDpRank)> {
+        if phase != RequestPhase::Prefill {
+            return None;
+        }
+        // Phase-gated sticky session id; also confirms session_control exists.
+        let session_id = self.sticky.session_id_for_phase(request, phase)?.to_string();
+
+        // Per-(worker, dp_rank) prefill load for THIS request's tokens, so the
+        // hot/cold comparison reflects what adding this request would cost.
+        let routing_parts = RoutingRequestParts::new(request);
+        let lora_name = request.routing.as_ref().and_then(|r| r.lora_name.clone());
+        let loads = self
+            .chooser
+            .get_potential_loads(
+                routing_parts.token_ids,
+                request.router_config_override.as_ref(),
+                routing_parts.block_mm_infos,
+                lora_name.as_deref(),
+            )
+            .await
+            .ok()?;
+
+        let hot_load = loads
+            .iter()
+            .find(|l| l.worker_id == hot.worker_id && l.dp_rank == hot.dp_rank)?
+            .potential_prefill_tokens;
+        let cold = loads
+            .iter()
+            .filter(|l| !(l.worker_id == hot.worker_id && l.dp_rank == hot.dp_rank))
+            .min_by_key(|l| l.potential_prefill_tokens)?;
+
+        // Hysteresis: only rebind when the hot rank is meaningfully hotter.
+        if hot_load.saturating_sub(cold.potential_prefill_tokens) <= REBIND_HYSTERESIS_TOKENS {
+            return None;
+        }
+        // Cooldown: avoid thrash on a session we just moved.
+        if self.sticky.in_rebind_cooldown(&session_id, REBIND_COOLDOWN) {
+            return None;
+        }
+
+        // TTL preserved from the session_control timeout (sticky gating already
+        // guaranteed session_control is present via session_id_for_phase).
+        let ttl = request
+            .routing
+            .as_ref()
+            .and_then(|r| r.session_control.as_ref())
+            .map(|sc| Duration::from_secs(sc.timeout))
+            .unwrap_or(REBIND_DEFAULT_TTL);
+
+        let cold_target = WorkerWithDpRank::new(cold.worker_id, cold.dp_rank);
+        let old = self.sticky.rebind(&session_id, cold_target, ttl);
+        let old_hot = old.unwrap_or(hot);
+
+        // G2: confirm at runtime that this LIVE branch fires.
+        tracing::info!(
+            %session_id,
+            hot_worker_id = old_hot.worker_id,
+            hot_dp_rank = old_hot.dp_rank,
+            hot_potential_prefill_tokens = hot_load,
+            cold_worker_id = cold_target.worker_id,
+            cold_dp_rank = cold_target.dp_rank,
+            cold_potential_prefill_tokens = cold.potential_prefill_tokens,
+            "Layer-2 rebind fired on live prefill path (select_and_dispatch_prefill)"
+        );
+
+        Some((old_hot, cold_target))
+    }
+
     pub(crate) async fn select_and_dispatch_prefill<M, F>(
         &self,
         mut request: SingleIn<PreprocessedRequest>,
@@ -362,6 +455,28 @@ impl KvPushRouter {
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
         let mut selection = self.select_request(&request, phase, false).await?;
+
+        // --- Layer-2 KV-migration rebind hook (LIVE prefill path) ---
+        // `selection` is the single value consumed by both `prepare` (below)
+        // and `dispatch_selection`; overwriting it redirects the REAL forwarded
+        // request, not a dead branch (G2). The OLD/hot source rides on
+        // `request.migrate_from` because `prepare` only receives the cold rank.
+        let hot = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
+        if let Some((old_hot, cold)) = self.check_and_trigger_rebind(&request, phase, hot).await {
+            selection.instance_id = cold.worker_id;
+            selection.dp_rank = cold.dp_rank;
+            let session_id = self
+                .sticky
+                .session_id_for_phase(&request, phase)
+                .map(str::to_string)
+                .unwrap_or_default();
+            request.migrate_from = Some(MigrateFrom {
+                source: old_hot,
+                session_id,
+            });
+        }
+        // --- end rebind hook ---
+
         let mut guard = self.track_selection(&request, &mut selection).await?;
         let metadata = match prepare(&mut request, selection.instance_id, Some(selection.dp_rank)) {
             Ok(metadata) => metadata,

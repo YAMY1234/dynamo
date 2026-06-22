@@ -7,7 +7,7 @@ use std::sync::Arc;
 use derive_builder::Builder;
 use dynamo_kv_router::{
     config::RouterConfigOverride,
-    protocols::{BlockExtraInfo, RoutingConstraints, WorkerId},
+    protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +105,19 @@ pub struct TraceLink {
     pub trace_id: String,
     /// W3C span_id of the predecessor span (16 hex chars).
     pub span_id: String,
+}
+
+/// Directs the receiving prefill worker to pull this session's KV prefix
+/// from a previously-hot `(worker, dp_rank)`. Set by the router's Layer-2
+/// rebind trigger on the prefill dispatch path; read by the SGLang
+/// data-plane (`req.migrate_from`). Framework-owned — engines read it but
+/// never write it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MigrateFrom {
+    /// OLD (hot) source the cold rank pulls KV from.
+    pub source: WorkerWithDpRank,
+    /// Session whose KV prefix is being migrated.
+    pub session_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -228,6 +241,14 @@ pub struct PreprocessedRequest {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_link: Option<TraceLink>,
+
+    /// Layer-2 KV-migration directive. When set, the receiving prefill worker
+    /// pulls this session's KV prefix from `source` (the previously-hot rank)
+    /// before prefilling. Framework-owned — set only by the sticky rebind
+    /// trigger on the prefill dispatch path; engines read it but never write it.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrate_from: Option<MigrateFrom>,
 
     /// Bootstrap info for disaggregated serving
     #[builder(default)]

@@ -354,6 +354,22 @@ impl PrefillRouter {
         routing.prefill_dp_rank = dp_rank;
         request.bootstrap_info = bootstrap_info.clone();
 
+        // Layer-2: a `migrate_from` set by the rebind trigger (push_router) on
+        // the cold rank's request must survive to the worker. This fn only
+        // writes prefill routing/bootstrap, never `migrate_from`, so the field
+        // is left intact and ships via `dispatch_selection`. Log to confirm the
+        // directive is forwarded at runtime.
+        if let Some(mf) = &request.migrate_from {
+            tracing::info!(
+                cold_worker_id = worker_id,
+                cold_dp_rank = ?dp_rank,
+                src_worker_id = mf.source.worker_id,
+                src_dp_rank = mf.source.dp_rank,
+                session_id = %mf.session_id,
+                "Forwarding prefill with migrate_from directive (cold rank pulls KV from hot)"
+            );
+        }
+
         Ok(PreparedPrefill {
             worker_id,
             bootstrap_info,

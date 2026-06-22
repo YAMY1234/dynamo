@@ -68,6 +68,40 @@ impl StickySessionCoordinator {
         self.router.peek_session(session_id)
     }
 
+    /// Phase-gated sticky session id for this request, or `None` when sticky
+    /// routing is not applicable (no session_control, or explicit pins set).
+    /// Reuses the same gating as the resolve/bind paths so the Layer-2 rebind
+    /// trigger never fires on a request the rest of the sticky layer ignores.
+    pub(crate) fn session_id_for_phase<'a>(
+        &self,
+        request: &'a PreprocessedRequest,
+        phase: RequestPhase,
+    ) -> Option<&'a str> {
+        sticky_session_id_for_phase(request, phase)
+    }
+
+    /// Layer-2 rebind: move `session_id` to a colder `(worker, dp_rank)`,
+    /// returning the OLD (hot) target for the `migrate_from` directive.
+    /// `RouterOnly` so no lifecycle open/close RPC fires (the migrate pull is
+    /// data-plane). See [`StickySessionRouter::rebind`].
+    pub(crate) fn rebind(
+        &self,
+        session_id: &str,
+        cold: WorkerWithDpRank,
+        ttl: Duration,
+    ) -> Option<WorkerWithDpRank> {
+        let (old, _token) =
+            self.router
+                .rebind(session_id, cold, ttl, AffinityKind::RouterOnly);
+        old
+    }
+
+    /// True if `session_id` was rebound within `cooldown`; used to throttle
+    /// Layer-2 rebinds.
+    pub(crate) fn in_rebind_cooldown(&self, session_id: &str, cooldown: Duration) -> bool {
+        self.router.in_rebind_cooldown(session_id, cooldown)
+    }
+
     pub fn refresh_worker_for_phase(&self, request: &PreprocessedRequest, phase: RequestPhase) {
         let Some(session_id) = sticky_session_id_for_phase(request, phase) else {
             return;
