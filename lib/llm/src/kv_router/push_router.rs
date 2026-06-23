@@ -54,6 +54,23 @@ fn rebind_hysteresis_tokens() -> usize {
             .unwrap_or(REBIND_HYSTERESIS_TOKENS_DEFAULT)
     })
 }
+
+/// Optional override for the source worker's migration peer host, used when the
+/// Dynamo request plane is NATS (the worker's registry address is a subject, not
+/// a routable IP, so the host is otherwise unknown). Valid when all prefill ranks
+/// share one host — a single prefill node, the common case, and always true for
+/// intra-worker cross-dp-rank migration. The production fix is for SGLang to
+/// advertise its migration endpoint at registration; until then this env unblocks
+/// migration under a NATS request plane.
+fn migration_peer_host_override() -> Option<std::net::IpAddr> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<std::net::IpAddr>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_MIGRATION_PEER_HOST")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    })
+}
 /// Minimum interval between rebinds of the same session, to avoid thrash.
 const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
 /// Fallback TTL for a rebind when the request carries no session_control
@@ -524,14 +541,19 @@ impl KvPushRouter {
     /// endpoint, `tcp://{host}:{MIGRATION_PEER_PORT_BASE + dp_rank}`, for the
     /// `migrate_from` directive.
     ///
-    /// The host comes from the source worker's registry entry. Only TCP
-    /// request-plane addresses carry a routable IP; in NATS request-plane mode
-    /// `transport.address()` is a subject, not an `ip:port`, so we return `None`
-    /// (the caller skips the directive but keeps the cold-rank rebind). The TCP
-    /// address string is `host:port[/endpoint]`, optionally `tcp://`-prefixed,
-    /// and may be IPv6 (`[::1]:port`); we parse it as a `SocketAddr` to extract
-    /// the host correctly rather than string-splitting on `:`.
+    /// The host comes from the source worker's registry entry when the request
+    /// plane is TCP (`host:port[/endpoint]`, optional `tcp://`, IPv6-safe, parsed
+    /// as a `SocketAddr`). Under a NATS request plane `transport` is a subject,
+    /// not an `ip:port`, so the host falls back to `DYN_MIGRATION_PEER_HOST`
+    /// (see [`migration_peer_host_override`]); without it we return `None` and the
+    /// caller skips the directive but keeps the cold-rank rebind.
     fn resolve_migration_endpoint(&self, src: WorkerWithDpRank) -> Option<String> {
+        // Port = base + dp_rank, guarded against u16 overflow (dp_rank is small
+        // in practice; this only trips on a misconfigured base or absurd rank).
+        let port = u16::try_from(src.dp_rank)
+            .ok()
+            .and_then(|r| MIGRATION_PEER_PORT_BASE.checked_add(r))?;
+
         let inst = self
             .chooser
             .client()
@@ -539,25 +561,24 @@ impl KvPushRouter {
             .into_iter()
             .find(|i| i.instance_id == src.worker_id)?;
 
-        let addr_str = match &inst.transport {
-            TransportType::Tcp(addr) => addr.as_str(),
-            // NATS request plane: address is a subject, not a routable host.
-            // Migration is unsupported here (documented limitation); skip.
-            TransportType::Nats(_) => return None,
+        let host: std::net::IpAddr = match &inst.transport {
+            // Strip an optional `tcp://` scheme and any `/endpoint` suffix, then
+            // parse the remaining `host:port` as a SocketAddr (IPv6-safe).
+            TransportType::Tcp(addr) => {
+                let trimmed = addr.strip_prefix("tcp://").unwrap_or(addr);
+                let socket_part = trimmed.split('/').next()?;
+                let socket: std::net::SocketAddr = socket_part.parse().ok()?;
+                socket.ip()
+            }
+            // NATS request plane: subject carries no routable host. Prefer an
+            // explicitly configured host; otherwise emit the unspecified host
+            // 0.0.0.0 as a sentinel that tells the SGLang target to substitute
+            // its own local IP — valid for intra-worker cross-dp-rank migration,
+            // where source and target share a node.
+            TransportType::Nats(_) => migration_peer_host_override()
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
         };
 
-        // Strip an optional `tcp://` scheme and any `/endpoint` suffix, then
-        // parse the remaining `host:port` as a SocketAddr (IPv6-safe).
-        let trimmed = addr_str.strip_prefix("tcp://").unwrap_or(addr_str);
-        let socket_part = trimmed.split('/').next()?;
-        let socket: std::net::SocketAddr = socket_part.parse().ok()?;
-        let host = socket.ip();
-
-        // Port = base + dp_rank, guarded against u16 overflow (dp_rank is small
-        // in practice; this only trips on a misconfigured base or absurd rank).
-        let port = u16::try_from(src.dp_rank)
-            .ok()
-            .and_then(|r| MIGRATION_PEER_PORT_BASE.checked_add(r))?;
         // SocketAddr's Display brackets IPv6 hosts; reconstruct so the migration
         // port (not the original request port) is used while keeping IPv6 valid.
         let migration_socket = std::net::SocketAddr::new(host, port);
