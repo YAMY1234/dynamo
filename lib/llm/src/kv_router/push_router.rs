@@ -40,7 +40,20 @@ use selection::{RoutingRequestParts, WorkerSelection};
 
 /// Layer-2 rebind hysteresis: the hot rank's potential prefill tokens must
 /// exceed the coldest rank's by more than this before a rebind fires.
-const REBIND_HYSTERESIS_TOKENS: usize = 4096;
+/// Production default 4096; overridable via `DYN_REBIND_HYSTERESIS_TOKENS`
+/// for controlled test/demo runs where a smaller imbalance must trigger.
+const REBIND_HYSTERESIS_TOKENS_DEFAULT: usize = 4096;
+
+fn rebind_hysteresis_tokens() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_HYSTERESIS_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_HYSTERESIS_TOKENS_DEFAULT)
+    })
+}
 /// Minimum interval between rebinds of the same session, to avoid thrash.
 const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
 /// Fallback TTL for a rebind when the request carries no session_control
@@ -405,6 +418,12 @@ impl KvPushRouter {
         }
         // Phase-gated sticky session id; also confirms session_control exists.
         let session_id = self.sticky.session_id_for_phase(request, phase)?.to_string();
+        // DIAG (bounded to sticky requests only): confirms nvext.session_control
+        // round-tripped into routing and reached the live rebind check.
+        tracing::info!(
+            %session_id,
+            "Layer-2 diag: sticky prefill reached rebind check (session_control present)"
+        );
 
         // F1: only rebind an EXISTING binding (affinity HIT). A brand-new
         // session's first turn carries session_control but has no prior home
@@ -412,7 +431,13 @@ impl KvPushRouter {
         // worker, not proof of a prior sticky home, so it cannot substitute for
         // this check. `worker_for_phase` -> `peek_session` is side-effect-free
         // (does NOT refresh TTL), so gating here is observationally pure.
-        self.sticky.worker_for_phase(request, phase)?;
+        if self.sticky.worker_for_phase(request, phase).is_none() {
+            tracing::info!(
+                %session_id,
+                "Layer-2 diag: no prior sticky binding (first turn / unbound) — skip rebind"
+            );
+            return None;
+        }
 
         // Per-(worker, dp_rank) prefill load for THIS request's tokens, so the
         // hot/cold comparison reflects what adding this request would cost.
@@ -439,7 +464,19 @@ impl KvPushRouter {
             .min_by_key(|l| l.potential_prefill_tokens)?;
 
         // Hysteresis: only rebind when the hot rank is meaningfully hotter.
-        if hot_load.saturating_sub(cold.potential_prefill_tokens) <= REBIND_HYSTERESIS_TOKENS {
+        let gap = hot_load.saturating_sub(cold.potential_prefill_tokens);
+        let hysteresis = rebind_hysteresis_tokens();
+        // DIAG (bounded to sticky requests with an existing binding): shows
+        // whether the hot/cold imbalance reached the trigger threshold.
+        tracing::info!(
+            %session_id,
+            hot_load,
+            cold_load = cold.potential_prefill_tokens,
+            gap,
+            hysteresis,
+            "Layer-2 diag: load gap before hysteresis gate"
+        );
+        if gap <= hysteresis {
             return None;
         }
         // Cooldown: avoid thrash on a session we just moved.
