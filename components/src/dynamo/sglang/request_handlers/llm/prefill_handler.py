@@ -150,6 +150,17 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 f"Prefill request {context.id()} will use LoRA adapter: {lora_path}"
             )
 
+        # Layer-2 diag (fires only when the router attached a migrate_from): confirms
+        # the directive survived the Dynamo->SGLang ingress and is being forwarded.
+        _mf = inner_request.get("migrate_from")
+        if _mf is not None:
+            logging.warning(
+                "[prefill-migration] handler received migrate_from=%r supported=%s rid=%s",
+                _mf,
+                self._engine_supports_migrate_from,
+                context.id(),
+            )
+
         results = await self.engine.async_generate(
             **input_param,
             **mm_kwargs,
@@ -164,6 +175,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             **self._session_kwargs(inner_request),
             lora_path=lora_path,
             **self._priority_kwargs(priority),
+            **self._migrate_from_kwargs(inner_request),
         )
 
         if inner_request.get(HEALTH_CHECK_KEY):

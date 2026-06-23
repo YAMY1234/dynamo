@@ -673,11 +673,15 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             self._engine_supports_priority = (
                 "priority" in inspect.signature(engine.async_generate).parameters
             )
+            self._engine_supports_migrate_from = (
+                "migrate_from" in inspect.signature(engine.async_generate).parameters
+            )
         else:
             # Encode-only workers (e.g. MultimodalEncodeWorkerHandler) don't
             # have an sgl.Engine.
             self.input_param_manager = InputParamManager(None)
             self._engine_supports_priority = False
+            self._engine_supports_migrate_from = False
         self._pause_controller = (
             SGLangEnginePauseController(engine) if engine is not None else None
         )
@@ -694,6 +698,16 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
             ):
                 normalized = -normalized
             return {"priority": normalized}
+        return {}
+
+    def _migrate_from_kwargs(self, inner_request: Dict[str, Any]) -> Dict[str, Any]:
+        # Layer-2 KV migration directive from the router. Wire shape is a
+        # 2-element [source_endpoint, source_dp_rank]; SGLang's GenerateReqInput
+        # wants Tuple[str, int]. Gated on engine support so a mismatched (older)
+        # SGLang install degrades gracefully instead of raising on the kwarg.
+        migrate_from = inner_request.get("migrate_from")
+        if migrate_from is not None and self._engine_supports_migrate_from:
+            return {"migrate_from": tuple(migrate_from)}
         return {}
 
     async def release_memory_occupation(self, body: dict) -> dict:
