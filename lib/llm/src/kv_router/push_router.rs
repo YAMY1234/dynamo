@@ -71,6 +71,27 @@ fn migration_peer_host_override() -> Option<std::net::IpAddr> {
             .and_then(|s| s.trim().parse().ok())
     })
 }
+
+/// Warn (once) that a cross-worker rebind cannot carry a migrate_from directive.
+/// Migration is scoped to intra-worker cross-dp-rank rebalancing; a cross-worker
+/// source host is remote and unknowable under a NATS request plane, so we keep the
+/// load-balancing rebind but drop the KV-reuse directive (unless an explicit
+/// `DYN_MIGRATION_PEER_HOST` opts into a known topology).
+fn warn_cross_worker_migration_skipped(src: WorkerWithDpRank, dst: WorkerWithDpRank) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            src_worker_id = src.worker_id,
+            src_dp_rank = src.dp_rank,
+            dst_worker_id = dst.worker_id,
+            dst_dp_rank = dst.dp_rank,
+            "Layer-2 rebind: cross-worker rebind — migrate_from skipped (migration is \
+             intra-worker only unless DYN_MIGRATION_PEER_HOST is set); proceeding with the \
+             cold-worker rebind for load balancing"
+        );
+    }
+}
 /// Minimum interval between rebinds of the same session, to avoid thrash.
 const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
 /// Fallback TTL for a rebind when the request carries no session_control
@@ -612,30 +633,44 @@ impl KvPushRouter {
             selection.instance_id = cold.worker_id;
             selection.dp_rank = cold.dp_rank;
 
-            // Resolve the source (hot) worker_id -> host via the registry, then
-            // build the deterministic SGLang migration peer endpoint. May be
-            // None in NATS request-plane mode or if the source worker is gone.
-            match self.resolve_migration_endpoint(old_hot) {
-                Some(source_endpoint) => {
-                    let session_id = self
-                        .sticky
-                        .session_id_for_phase(&request, phase)
-                        .map(str::to_string)
-                        .unwrap_or_default();
-                    request.migrate_from = Some(MigrateFrom {
-                        source_endpoint,
-                        source_dp_rank: old_hot.dp_rank,
-                        session_id,
-                    });
-                }
-                None => {
-                    tracing::warn!(
-                        hot_worker_id = old_hot.worker_id,
-                        hot_dp_rank = old_hot.dp_rank,
-                        "Layer-2 rebind: could not resolve source migration endpoint \
-                         (non-TCP request plane, or source worker gone); proceeding with \
-                         the cold-rank rebind but without a migrate_from directive"
-                    );
+            // Migration directive is only meaningful for an INTRA-WORKER rebind:
+            // source `old_hot` and target `cold` on the same worker = same node, so
+            // the host-agnostic 0.0.0.0 sentinel resolves correctly to the source
+            // host on the SGLang side (the target's own local IP). A cross-worker
+            // rebind's source host is genuinely remote and unknowable under a NATS
+            // request plane, so we skip the directive — keeping the load-balancing
+            // rebind — unless an explicit DYN_MIGRATION_PEER_HOST opts into a known
+            // topology. (Cross-worker migration would need per-worker endpoint
+            // advertisement; tracked as a follow-up.)
+            let intra_worker = old_hot.worker_id == cold.worker_id;
+            if !intra_worker && migration_peer_host_override().is_none() {
+                warn_cross_worker_migration_skipped(old_hot, cold);
+            } else {
+                // Resolve the source (hot) worker_id -> host via the registry, then
+                // build the deterministic SGLang migration peer endpoint. May be
+                // None in NATS request-plane mode or if the source worker is gone.
+                match self.resolve_migration_endpoint(old_hot) {
+                    Some(source_endpoint) => {
+                        let session_id = self
+                            .sticky
+                            .session_id_for_phase(&request, phase)
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        request.migrate_from = Some(MigrateFrom {
+                            source_endpoint,
+                            source_dp_rank: old_hot.dp_rank,
+                            session_id,
+                        });
+                    }
+                    None => {
+                        tracing::warn!(
+                            hot_worker_id = old_hot.worker_id,
+                            hot_dp_rank = old_hot.dp_rank,
+                            "Layer-2 rebind: could not resolve source migration endpoint \
+                             (non-TCP request plane, or source worker gone); proceeding with \
+                             the cold-rank rebind but without a migrate_from directive"
+                        );
+                    }
                 }
             }
         }
