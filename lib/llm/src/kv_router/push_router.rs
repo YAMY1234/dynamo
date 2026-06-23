@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
 use dynamo_runtime::{
+    component::TransportType,
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
     pipeline::{
         AsyncEngine, AsyncEngineContextProvider, Error, ManyOut, PushRouter, ResponseStream,
@@ -46,6 +47,16 @@ const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
 /// timeout (in practice sticky gating guarantees one is present).
 const REBIND_DEFAULT_TTL: Duration = Duration::from_secs(300);
 
+/// Base TCP port for SGLang per-rank migration peer channels: source attention
+/// dp_rank `r` binds `MIGRATION_PEER_PORT_BASE + r`. This MUST equal the value
+/// SGLang is launched with (`--prefill-migration-peer-port-base`); a silent
+/// mismatch sends the migrate_from directive to a dead port.
+///
+/// TODO(layer2): plumb this from prefill-router config instead of hardcoding so
+/// the router and SGLang values are configured from one source. Tracked as an
+/// open item before merge.
+const MIGRATION_PEER_PORT_BASE: u16 = 20000;
+
 pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     pub chooser: Arc<KvRouter>,
@@ -65,6 +76,19 @@ impl KvPushRouter {
 
         let component = chooser.client().endpoint.component().clone();
         let sticky = Arc::new(StickySessionCoordinator::new(component));
+
+        // F2: the Layer-2 rebind hysteresis compares potential_prefill_tokens,
+        // which is only populated when router_track_prefill_tokens is enabled.
+        // Warn once at startup so an inert rebind path isn't mistaken for "no
+        // overload ever happened". This runs once per router construction, so
+        // "one-time" is free (no Once/atomic needed).
+        if !chooser.kv_router_config().router_track_prefill_tokens {
+            tracing::warn!(
+                "Layer-2 KV-migration rebind: router_track_prefill_tokens=false, so the \
+                 rebind hysteresis (compares potential_prefill_tokens) will never trip and \
+                 migration is inert. Set router_track_prefill_tokens=true to activate."
+            );
+        }
 
         KvPushRouter {
             inner,
@@ -382,6 +406,14 @@ impl KvPushRouter {
         // Phase-gated sticky session id; also confirms session_control exists.
         let session_id = self.sticky.session_id_for_phase(request, phase)?.to_string();
 
+        // F1: only rebind an EXISTING binding (affinity HIT). A brand-new
+        // session's first turn carries session_control but has no prior home
+        // rank — there is nothing to migrate FROM. `hot` is the freshly-selected
+        // worker, not proof of a prior sticky home, so it cannot substitute for
+        // this check. `worker_for_phase` -> `peek_session` is side-effect-free
+        // (does NOT refresh TTL), so gating here is observationally pure.
+        self.sticky.worker_for_phase(request, phase)?;
+
         // Per-(worker, dp_rank) prefill load for THIS request's tokens, so the
         // hot/cold comparison reflects what adding this request would cost.
         let routing_parts = RoutingRequestParts::new(request);
@@ -424,6 +456,14 @@ impl KvPushRouter {
             .map(|sc| Duration::from_secs(sc.timeout))
             .unwrap_or(REBIND_DEFAULT_TTL);
 
+        // F3: the store.put inside rebind() is immediately overwritten by the
+        // identical on_routed() bind once `selection` is redirected to the cold
+        // rank by the caller (dispatch_selection -> on_routed -> bind, same
+        // store key). Only the last_rebind COOLDOWN STAMP set by rebind() is
+        // load-bearing here. The double-put is intentional/harmless, not a bug;
+        // do not "optimize" it away without first moving the cooldown stamp into
+        // on_routed (rebind() has dedicated tests in sticky/router.rs that a
+        // split would force-update).
         let cold_target = WorkerWithDpRank::new(cold.worker_id, cold.dp_rank);
         let old = self.sticky.rebind(&session_id, cold_target, ttl);
         let old_hot = old.unwrap_or(hot);
@@ -441,6 +481,50 @@ impl KvPushRouter {
         );
 
         Some((old_hot, cold_target))
+    }
+
+    /// Resolve the source (hot) worker's deterministic SGLang migration peer
+    /// endpoint, `tcp://{host}:{MIGRATION_PEER_PORT_BASE + dp_rank}`, for the
+    /// `migrate_from` directive.
+    ///
+    /// The host comes from the source worker's registry entry. Only TCP
+    /// request-plane addresses carry a routable IP; in NATS request-plane mode
+    /// `transport.address()` is a subject, not an `ip:port`, so we return `None`
+    /// (the caller skips the directive but keeps the cold-rank rebind). The TCP
+    /// address string is `host:port[/endpoint]`, optionally `tcp://`-prefixed,
+    /// and may be IPv6 (`[::1]:port`); we parse it as a `SocketAddr` to extract
+    /// the host correctly rather than string-splitting on `:`.
+    fn resolve_migration_endpoint(&self, src: WorkerWithDpRank) -> Option<String> {
+        let inst = self
+            .chooser
+            .client()
+            .instances()
+            .into_iter()
+            .find(|i| i.instance_id == src.worker_id)?;
+
+        let addr_str = match &inst.transport {
+            TransportType::Tcp(addr) => addr.as_str(),
+            // NATS request plane: address is a subject, not a routable host.
+            // Migration is unsupported here (documented limitation); skip.
+            TransportType::Nats(_) => return None,
+        };
+
+        // Strip an optional `tcp://` scheme and any `/endpoint` suffix, then
+        // parse the remaining `host:port` as a SocketAddr (IPv6-safe).
+        let trimmed = addr_str.strip_prefix("tcp://").unwrap_or(addr_str);
+        let socket_part = trimmed.split('/').next()?;
+        let socket: std::net::SocketAddr = socket_part.parse().ok()?;
+        let host = socket.ip();
+
+        // Port = base + dp_rank, guarded against u16 overflow (dp_rank is small
+        // in practice; this only trips on a misconfigured base or absurd rank).
+        let port = u16::try_from(src.dp_rank)
+            .ok()
+            .and_then(|r| MIGRATION_PEER_PORT_BASE.checked_add(r))?;
+        // SocketAddr's Display brackets IPv6 hosts; reconstruct so the migration
+        // port (not the original request port) is used while keeping IPv6 valid.
+        let migration_socket = std::net::SocketAddr::new(host, port);
+        Some(format!("tcp://{migration_socket}"))
     }
 
     pub(crate) async fn select_and_dispatch_prefill<M, F>(
@@ -463,17 +547,39 @@ impl KvPushRouter {
         // `request.migrate_from` because `prepare` only receives the cold rank.
         let hot = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
         if let Some((old_hot, cold)) = self.check_and_trigger_rebind(&request, phase, hot).await {
+            // Redirect the REAL forwarded request to the cold rank regardless of
+            // whether we can build a migrate_from directive (the rebind itself
+            // is the load-balancing action; migrate_from is the KV-reuse
+            // optimization on top of it).
             selection.instance_id = cold.worker_id;
             selection.dp_rank = cold.dp_rank;
-            let session_id = self
-                .sticky
-                .session_id_for_phase(&request, phase)
-                .map(str::to_string)
-                .unwrap_or_default();
-            request.migrate_from = Some(MigrateFrom {
-                source: old_hot,
-                session_id,
-            });
+
+            // Resolve the source (hot) worker_id -> host via the registry, then
+            // build the deterministic SGLang migration peer endpoint. May be
+            // None in NATS request-plane mode or if the source worker is gone.
+            match self.resolve_migration_endpoint(old_hot) {
+                Some(source_endpoint) => {
+                    let session_id = self
+                        .sticky
+                        .session_id_for_phase(&request, phase)
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    request.migrate_from = Some(MigrateFrom {
+                        source_endpoint,
+                        source_dp_rank: old_hot.dp_rank,
+                        session_id,
+                    });
+                }
+                None => {
+                    tracing::warn!(
+                        hot_worker_id = old_hot.worker_id,
+                        hot_dp_rank = old_hot.dp_rank,
+                        "Layer-2 rebind: could not resolve source migration endpoint \
+                         (non-TCP request plane, or source worker gone); proceeding with \
+                         the cold-rank rebind but without a migrate_from directive"
+                    );
+                }
+            }
         }
         // --- end rebind hook ---
 

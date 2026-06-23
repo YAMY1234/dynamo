@@ -469,6 +469,49 @@ mod tests {
         assert_eq!(map.get("sess-1").unwrap().worker, worker(42, 7));
     }
 
+    /// F1: the Layer-2 rebind trigger gates on an existing binding via
+    /// `worker_for_phase` -> `peek_session(...).is_some()`. This encodes the
+    /// HIT-vs-MISS semantics the gate relies on: a fresh session (no prior
+    /// bind) is a MISS and must NOT trigger a rebind; an already-bound session
+    /// is a HIT and IS eligible. Mirrors the `self.sticky.worker_for_phase(..)?`
+    /// short-circuit in `check_and_trigger_rebind` (push_router.rs).
+    #[test]
+    fn rebind_gate_fires_on_existing_binding_not_on_fresh_session() {
+        let store = InMemoryAffinityStore {
+            map: Arc::new(DashMap::new()),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+
+        // Fresh session (a brand-new conversation's first turn): no prior home
+        // rank -> peek is a MISS -> the gate short-circuits, no rebind.
+        assert!(
+            router.peek_session("fresh-session").is_none(),
+            "a never-bound session must be a MISS so the rebind gate skips it"
+        );
+
+        // Bind it (simulating a prior turn's on_routed), then the same session
+        // is a HIT and the rebind gate would proceed.
+        router.bind(
+            "bound-session",
+            worker(11, 2),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        assert_eq!(
+            router.peek_session("bound-session"),
+            Some(worker(11, 2)),
+            "an already-bound session must be a HIT so the rebind gate proceeds"
+        );
+
+        // And the peek used by the gate must NOT have created a binding for the
+        // fresh session as a side effect.
+        assert!(
+            router.peek_session("fresh-session").is_none(),
+            "gate peek must be side-effect-free (no implicit bind on MISS)"
+        );
+    }
+
     #[test]
     fn rebind_records_cooldown() {
         let store = InMemoryAffinityStore {

@@ -363,8 +363,8 @@ impl PrefillRouter {
             tracing::info!(
                 cold_worker_id = worker_id,
                 cold_dp_rank = ?dp_rank,
-                src_worker_id = mf.source.worker_id,
-                src_dp_rank = mf.source.dp_rank,
+                src_endpoint = %mf.source_endpoint,
+                src_dp_rank = mf.source_dp_rank,
                 session_id = %mf.session_id,
                 "Forwarding prefill with migrate_from directive (cold rank pulls KV from hot)"
             );

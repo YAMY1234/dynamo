@@ -7,7 +7,7 @@ use std::sync::Arc;
 use derive_builder::Builder;
 use dynamo_kv_router::{
     config::RouterConfigOverride,
-    protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
+    protocols::{BlockExtraInfo, RoutingConstraints, WorkerId},
 };
 use serde::{Deserialize, Serialize};
 
@@ -108,16 +108,55 @@ pub struct TraceLink {
 }
 
 /// Directs the receiving prefill worker to pull this session's KV prefix
-/// from a previously-hot `(worker, dp_rank)`. Set by the router's Layer-2
-/// rebind trigger on the prefill dispatch path; read by the SGLang
-/// data-plane (`req.migrate_from`). Framework-owned — engines read it but
-/// never write it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// from a previously-hot rank. Set by the router's Layer-2 rebind trigger on
+/// the prefill dispatch path; read by the SGLang data-plane as
+/// `req.migrate_from: Optional[Tuple[str, int]]`. Framework-owned — engines
+/// read it but never write it.
+///
+/// WIRE SHAPE (see custom serde below): a 2-element JSON array
+/// `[source_endpoint, source_dp_rank]`. `session_id` is Dynamo-internal and
+/// deliberately NOT serialized — SGLang's tuple decode expects exactly two
+/// elements, so any third element would corrupt it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateFrom {
-    /// OLD (hot) source the cold rank pulls KV from.
-    pub source: WorkerWithDpRank,
-    /// Session whose KV prefix is being migrated.
+    /// Clean ZMQ-connectable peer endpoint, `"tcp://ip:port"` (NO
+    /// instance/endpoint suffix). The receiving SGLang worker feeds this
+    /// verbatim to its migration peer-channel connect. The host is resolved by
+    /// Dynamo from the source worker's registry entry; the port is the
+    /// deterministic `migration_peer_port_base + source_dp_rank` both sides
+    /// agree on.
+    pub source_endpoint: String,
+    /// Source attention DP rank (informational on the SGLang side;
+    /// `migrate_from[1]`).
+    pub source_dp_rank: u32,
+    /// Session whose KV prefix is being migrated. Dynamo-internal; NOT placed
+    /// on the wire (see the custom `Serialize`/`Deserialize` below).
     pub session_id: String,
+}
+
+// Custom serde so the wire form is exactly the 2-element array SGLang reads
+// as `Tuple[str, int]`. `session_id` is intentionally excluded from the wire
+// and defaults to empty on deserialize (engines never produce this field, so
+// the deserialize path exists only for round-trip/test symmetry).
+impl Serialize for MigrateFrom {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tup = serializer.serialize_tuple(2)?;
+        tup.serialize_element(&self.source_endpoint)?;
+        tup.serialize_element(&self.source_dp_rank)?;
+        tup.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for MigrateFrom {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (source_endpoint, source_dp_rank) = <(String, u32)>::deserialize(deserializer)?;
+        Ok(MigrateFrom {
+            source_endpoint,
+            source_dp_rank,
+            session_id: String::new(),
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -420,6 +459,59 @@ mod tests {
     /// pick up `serde(default)` so the runtime's `JsonProbeAdapter` can
     /// deserialize without rewriting the JSON. Regression guard against the
     /// "missing field" failures the smoke tests hit.
+    /// The Layer-2 `migrate_from` wire shape must be EXACTLY the 2-element
+    /// array `[endpoint, dp_rank]` that SGLang decodes as `Tuple[str, int]`.
+    /// `session_id` is Dynamo-internal and must NOT appear on the wire (a third
+    /// element would break SGLang's tuple decode). Round-trips back with an
+    /// empty session_id since the wire doesn't carry it.
+    #[test]
+    fn migrate_from_serializes_as_two_element_array() {
+        let m = MigrateFrom {
+            source_endpoint: "tcp://10.0.0.5:20003".to_string(),
+            source_dp_rank: 3,
+            session_id: "sess-internal".to_string(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"["tcp://10.0.0.5:20003",3]"#, "got: {json}");
+        // session_id must not leak onto the wire.
+        assert!(!json.contains("sess-internal"), "got: {json}");
+
+        // SGLang-shaped tuple decodes back; session_id defaults to empty.
+        let back: MigrateFrom = serde_json::from_str(r#"["tcp://1.2.3.4:9000", 7]"#).unwrap();
+        assert_eq!(back.source_endpoint, "tcp://1.2.3.4:9000");
+        assert_eq!(back.source_dp_rank, 7);
+        assert!(back.session_id.is_empty());
+    }
+
+    /// `migrate_from` rides on `PreprocessedRequest` as the 2-tuple under the
+    /// `migrate_from` key, and is omitted entirely when unset.
+    #[test]
+    fn migrate_from_field_on_request_round_trips() {
+        let mut req = PreprocessedRequest::builder()
+            .model("t".to_string())
+            .token_ids(vec![1])
+            .stop_conditions(StopConditions::default())
+            .sampling_options(SamplingOptions::default())
+            .output_options(OutputOptions::default())
+            .build()
+            .unwrap();
+
+        // Unset: omitted from the wire (skip_serializing_if).
+        let none = serde_json::to_string(&req).unwrap();
+        assert!(!none.contains("migrate_from"), "got: {none}");
+
+        req.migrate_from = Some(MigrateFrom {
+            source_endpoint: "tcp://10.0.0.5:20003".to_string(),
+            source_dp_rank: 3,
+            session_id: "sess".to_string(),
+        });
+        let set = serde_json::to_string(&req).unwrap();
+        assert!(
+            set.contains(r#""migrate_from":["tcp://10.0.0.5:20003",3]"#),
+            "got: {set}"
+        );
+    }
+
     #[test]
     fn minimal_canary_payload_deserializes() {
         let req: PreprocessedRequest = serde_json::from_value(serde_json::json!({
