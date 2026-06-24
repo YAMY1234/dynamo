@@ -212,12 +212,18 @@ impl
             .prefill_router
             .get()
             .ok_or_else(|| anyhow::anyhow!(PrefillError::NotActivated))?;
+        // PR#9936 port: capture the prefill router's selected DP rank so it can be
+        // preserved on the decode request below. The decode router overwrites
+        // routing.dp_rank with its own decode rank; SGLang needs the prefill rank
+        // to query the matching bootstrap peer (esp. when prefill_dp != decode_dp).
+        let captured_prefill_dp_rank: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
         let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> = async {
             let (prepared, prefill_stream) = router
                 .select_and_dispatch_prefill(
                     prefill_context,
                     preselected_worker,
                     |request, worker_id, dp_rank| {
+                        *captured_prefill_dp_rank.lock().unwrap() = dp_rank;
                         self.prepare_prefill_dispatch(request, worker_id, dp_rank)
                     },
                 )
@@ -298,6 +304,12 @@ impl
                 decode_req.routing_mut().prefill_worker_id = Some(worker_id);
             }
         };
+
+        // PR#9936 port: forward the prefill router's selected DP rank to the decode
+        // request so SGLang's decode worker queries the matching prefill bootstrap
+        // peer (without this, decode uses its own dp_rank and the bootstrap host
+        // resolves to none when prefill_dp_size != decode_dp_size).
+        decode_req.routing_mut().prefill_dp_rank = *captured_prefill_dp_rank.lock().unwrap();
 
         if let Some(topology_constraints) = topology_constraints {
             merge_decode_topology_constraints(&mut decode_req, topology_constraints);
