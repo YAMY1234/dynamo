@@ -396,6 +396,7 @@ impl SlotTrackerRegistry {
                 potential_prefill_tokens: prefill_tokens.get(&worker).copied().unwrap_or(0),
                 potential_decode_blocks,
                 active_requests: active_requests.get(&worker).copied().unwrap_or(0),
+                request_prefill_delta: new_isl_tokens,
             })
             .collect())
     }

@@ -401,6 +401,7 @@ pub struct StickySessionRouter {
     /// resurrects affinity, only gates a future rebind, so no separate reaper
     /// is required.
     last_rebind: DashMap<String, Instant>,
+    rebind_counts: DashMap<String, u32>,
 }
 
 impl StickySessionRouter {
@@ -409,6 +410,7 @@ impl StickySessionRouter {
         StickySessionRouter {
             store: Box::new(store),
             last_rebind: DashMap::new(),
+            rebind_counts: DashMap::new(),
         }
     }
 
@@ -496,6 +498,7 @@ impl StickySessionRouter {
         }
         self.last_rebind
             .insert(session_id.to_owned(), Instant::now());
+        *self.rebind_counts.entry(session_id.to_owned()).or_insert(0) += 1;
         tracing::info!(
             %session_id,
             old_worker_id = token.previous.binding.worker.worker_id,
@@ -511,6 +514,11 @@ impl StickySessionRouter {
     /// Discard a shadow rebind without disturbing a concurrent newer binding.
     pub(crate) fn rollback_rebind(&self, session_id: &str, token: AffinityRebindToken) -> bool {
         self.store.rollback_rebind(session_id, token)
+    }
+
+    /// Number of committed rebinds for this session (bounce cap input).
+    pub fn rebind_count(&self, session_id: &str) -> u32 {
+        self.rebind_counts.get(session_id).map(|c| *c).unwrap_or(0)
     }
 
     /// Returns true if this session was rebound less than `cooldown` ago.

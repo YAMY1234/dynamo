@@ -396,6 +396,7 @@ where
                     .unwrap_or(isl_tokens),
                 potential_decode_blocks,
                 active_requests: active_requests.get(&worker).copied().unwrap_or(0),
+                request_prefill_delta: prefill_token_deltas.tokens_for(worker),
             });
         }
 
@@ -1174,6 +1175,7 @@ mod tests {
                 potential_prefill_tokens: prefill_tokens.get(worker).copied().unwrap_or(128),
                 potential_decode_blocks: decode_blocks.get(worker).copied().unwrap_or(0),
                 active_requests: 0,
+                request_prefill_delta: 128,
             })
             .collect();
         expected.sort_by_key(|load| (load.worker_id, load.dp_rank));

@@ -48,7 +48,37 @@ use selection::{RoutingRequestParts, WorkerSelection};
 /// exceed the coldest rank's by more than this before a rebind fires.
 /// Production default 4096; overridable via `DYN_REBIND_HYSTERESIS_TOKENS`
 /// for controlled test/demo runs where a smaller imbalance must trigger.
-const REBIND_HYSTERESIS_TOKENS_DEFAULT: usize = 4096;
+// Raw-backlog gap threshold: the deferral a migration costs is roughly one
+// prefill iteration, so one chunk of tokens is the natural unit.
+const REBIND_HYSTERESIS_TOKENS_DEFAULT: usize = 32768;
+// Greedy load-shedding: only turns that bring at least this much NEW
+// (uncached-on-hot) prefill work are worth a migration's fixed overhead.
+const REBIND_MIN_NEW_TOKENS_DEFAULT: usize = 4096;
+// Bounce cap: each rebind costs a deferred turn + a transfer with
+// diminishing returns; stop ping-ponging a session after this many.
+const REBIND_MAX_PER_SESSION_DEFAULT: u32 = 4;
+
+fn rebind_min_new_tokens() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_MIN_NEW_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_MIN_NEW_TOKENS_DEFAULT)
+    })
+}
+
+fn rebind_max_per_session() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_MAX_PER_SESSION")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_MAX_PER_SESSION_DEFAULT)
+    })
+}
 
 fn rebind_hysteresis_tokens() -> usize {
     use std::sync::OnceLock;
@@ -802,7 +832,15 @@ impl KvPushRouter {
         // Lifecycle actions must reach the currently visible binding so Open,
         // Bind, and Close cannot race a shadow transition.
         let session_control = request.routing.as_ref()?.session_control.as_ref()?;
-        if session_control.action.is_some() {
+        // Lifecycle mutations (Open/Close) must reach the currently visible
+        // binding untouched. A per-turn idempotent Bind — what conv-aware
+        // clients send on every turn — is an ordinary data-plane turn and
+        // stays rebind-eligible; the shadow CAS still serializes any race.
+        if matches!(
+            session_control.action,
+            Some(crate::protocols::common::extensions::SessionAction::Open)
+                | Some(crate::protocols::common::extensions::SessionAction::Close)
+        ) {
             return None;
         }
         // Phase-gated sticky session id; also confirms session_control exists.
@@ -851,10 +889,18 @@ impl KvPushRouter {
             .await
             .ok()?;
 
-        let hot_load = loads
+        let hot_entry = loads
             .iter()
-            .find(|l| l.worker_id == hot.worker_id && l.dp_rank == hot.dp_rank)?
-            .potential_prefill_tokens;
+            .find(|l| l.worker_id == hot.worker_id && l.dp_rank == hot.dp_rank)?;
+        // Compare RAW scheduled backlog (cache discount removed). The
+        // discounted potential makes a cache-rich hot rank look cheapest for
+        // its own sessions, which inverts the trigger: it fires on young
+        // sessions with nothing to migrate and never on mature ones.
+        // Placement keeps the discounted potential; the trigger must not.
+        let hot_queue = hot_entry
+            .potential_prefill_tokens
+            .saturating_sub(hot_entry.request_prefill_delta);
+        let request_new_tokens = hot_entry.request_prefill_delta;
         let cold = loads
             .iter()
             .filter(|l| !(l.worker_id == hot.worker_id && l.dp_rank == hot.dp_rank))
@@ -867,25 +913,46 @@ impl KvPushRouter {
                         .worker_ineligibility_for_phase(request, phase, candidate)
                         .is_none()
             })
-            .min_by_key(|l| l.potential_prefill_tokens)?;
+            .min_by_key(|l| {
+                l.potential_prefill_tokens
+                    .saturating_sub(l.request_prefill_delta)
+            })?;
 
-        // Hysteresis: only rebind when the hot rank is meaningfully hotter.
-        let gap = hot_load.saturating_sub(cold.potential_prefill_tokens);
+        let cold_queue = cold
+            .potential_prefill_tokens
+            .saturating_sub(cold.request_prefill_delta);
+        let gap = hot_queue.saturating_sub(cold_queue);
         let hysteresis = rebind_hysteresis_tokens();
+        let min_new_tokens = rebind_min_new_tokens();
         // DIAG (bounded to sticky requests with an existing binding): shows
-        // whether the hot/cold imbalance reached the trigger threshold.
+        // whether the raw-backlog imbalance reached the trigger gates.
         tracing::info!(
             %session_id,
-            hot_load,
-            cold_load = cold.potential_prefill_tokens,
+            hot_queue,
+            cold_queue,
+            request_new_tokens,
             gap,
             hysteresis,
-            "Layer-2 diag: load gap before hysteresis gate"
+            min_new_tokens,
+            "Layer-2 diag: raw backlog gap before trigger gates"
         );
+        // Greedy load-shedding: small turns keep locality on the hot rank.
+        if request_new_tokens < min_new_tokens {
+            return None;
+        }
         if gap <= hysteresis {
             return None;
         }
-        // Cooldown: avoid thrash on a session we just moved.
+        // Bounce cap + cooldown: avoid thrash on a session we keep moving.
+        let bounce = self.sticky.rebind_count(&session_id);
+        if bounce >= rebind_max_per_session() {
+            tracing::info!(
+                %session_id,
+                bounce,
+                "Layer-2 rebind skipped: per-session bounce cap reached"
+            );
+            return None;
+        }
         if self.sticky.in_rebind_cooldown(&session_id, REBIND_COOLDOWN) {
             return None;
         }
@@ -1295,6 +1362,19 @@ mod tests {
     };
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    /// Rebind-trigger knobs are process-wide OnceLocks; pin them to
+    /// test-friendly values before the first check_rebind_decision call.
+    /// Every rebind test sets the SAME values, so parallel init is benign.
+    fn pin_rebind_trigger_env_for_tests() {
+        // SAFETY: test-only, every caller sets identical values, and the
+        // consumers read them once through OnceLock.
+        unsafe {
+            std::env::set_var("DYN_REBIND_MIN_NEW_TOKENS", "0");
+            std::env::set_var("DYN_REBIND_HYSTERESIS_TOKENS", "256");
+            std::env::set_var("DYN_REBIND_MAX_PER_SESSION", "100");
+        }
+    }
 
     fn session_request(
         session_id: &str,
@@ -1719,6 +1799,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_session_turn_is_rejected_while_rebind_is_pending_then_released() {
+        pin_rebind_trigger_env_for_tests();
         let router = make_dp_test_router().await;
         let hot = WorkerWithDpRank::new(42, 0);
         router
@@ -1809,6 +1890,7 @@ mod tests {
 
     #[tokio::test]
     async fn actionless_session_turn_rejection_preserves_accounting_and_allows_reacquire() {
+        pin_rebind_trigger_env_for_tests();
         let router = make_dp_test_router().await;
         let hot = WorkerWithDpRank::new(42, 0);
         router
@@ -1899,6 +1981,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebind_chooses_coldest_eligible_target() {
+        pin_rebind_trigger_env_for_tests();
         let router = make_dp_test_router_with_workers(&[42, 99]).await;
         let hot = WorkerWithDpRank::new(42, 0);
         let eligible_cold = WorkerWithDpRank::new(42, 1);
@@ -1964,6 +2047,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebind_books_and_tracks_only_the_final_cold_target() {
+        pin_rebind_trigger_env_for_tests();
         let router = make_dp_test_router().await;
         let hot = WorkerWithDpRank::new(42, 0);
         let cold = WorkerWithDpRank::new(42, 1);

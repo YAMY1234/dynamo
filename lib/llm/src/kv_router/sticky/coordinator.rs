@@ -223,6 +223,11 @@ impl StickySessionCoordinator {
         self.router.in_rebind_cooldown(session_id, cooldown)
     }
 
+    /// Committed rebind count for `session_id`; input to the Layer-2 bounce cap.
+    pub(crate) fn rebind_count(&self, session_id: &str) -> u32 {
+        self.router.rebind_count(session_id)
+    }
+
     pub fn refresh_worker_for_phase(&self, request: &PreprocessedRequest, phase: RequestPhase) {
         let Some(session_id) = sticky_session_id_for_phase(request, phase) else {
             return;

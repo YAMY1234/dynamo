@@ -498,6 +498,11 @@ pub struct PotentialLoad {
     pub potential_decode_blocks: usize,
     #[serde(default)]
     pub active_requests: usize,
+    /// Cache-discounted cost of placing THIS request on the worker (0 when the
+    /// load was computed without a request). potential - delta = the worker's
+    /// raw scheduled backlog, which is the right signal for rebind triggers.
+    #[serde(default)]
+    pub request_prefill_delta: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1861,6 +1866,7 @@ mod tests {
             potential_prefill_tokens: 16,
             potential_decode_blocks: 4,
             active_requests: 2,
+            request_prefill_delta: 0,
         };
 
         assert_eq!(
