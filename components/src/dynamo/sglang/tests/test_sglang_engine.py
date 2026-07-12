@@ -113,6 +113,8 @@ async def _check_start_populates_registration_metadata(started_engine):
 
 async def _check_runtime_data_includes_worker_group(monkeypatch):
     from dynamo.sglang import llm_engine as llm_engine_mod
+    from dynamo.common.backend.disagg import PREFILL_COMPLETE_CAPABILITY_KEY
+    from dynamo.common.constants import DisaggregationMode
     from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY
 
     monkeypatch.setattr(
@@ -124,6 +126,19 @@ async def _check_runtime_data_includes_worker_group(monkeypatch):
     assert llm_engine_mod._get_runtime_data(object()) == {
         SGLANG_WORKER_GROUP_ID_KEY: "dist_init:tcp://10.0.0.1:2345"
     }
+    assert llm_engine_mod._get_runtime_data(
+        object(),
+        DisaggregationMode.PREFILL,
+        supports_migrate_from=True,
+    ) == {
+        SGLANG_WORKER_GROUP_ID_KEY: "dist_init:tcp://10.0.0.1:2345",
+        PREFILL_COMPLETE_CAPABILITY_KEY: True,
+    }
+    assert llm_engine_mod._get_runtime_data(
+        object(),
+        DisaggregationMode.PREFILL,
+        supports_migrate_from=False,
+    ) == {SGLANG_WORKER_GROUP_ID_KEY: "dist_init:tcp://10.0.0.1:2345"}
 
 
 async def _check_generate_streams_chunks_with_coherent_final_usage(started_engine):

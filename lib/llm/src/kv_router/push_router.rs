@@ -20,10 +20,16 @@ use tracing::Instrument;
 
 use crate::{
     kv_router::{
-        KvRouter, metrics::RouterRequestMetrics, sticky::coordinator::StickySessionCoordinator,
+        KvRouter,
+        metrics::{RebindTransition, RouterRequestMetrics, record_rebind_transition},
+        sticky::{
+            coordinator::{SessionRebindGuard, SessionTurnGuard, StickySessionCoordinator},
+            router::{AffinityBindingToken, AffinityKind},
+        },
     },
     preprocessor::PreprocessedRequest,
     protocols::common::{
+        FinishReason,
         llm_backend::LLMEngineOutput,
         preprocessor::MigrateFrom,
         timing::{RequestPhase, RoutingData},
@@ -98,6 +104,167 @@ const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
 /// timeout (in practice sticky gating guarantees one is present).
 const REBIND_DEFAULT_TTL: Duration = Duration::from_secs(300);
 
+#[derive(Debug, Clone)]
+struct RebindDecision {
+    session_id: String,
+    expected: AffinityBindingToken,
+    cold: WorkerWithDpRank,
+    ttl: Duration,
+}
+
+struct PrefillSelection {
+    selection: WorkerSelection,
+    pending_rebind: Option<SessionRebindGuard>,
+    session_turn: Option<SessionTurnGuard>,
+}
+
+/// Internal SGLang prefill completion ACK carried in the existing
+/// `LLMEngineOutput.extra_args` field. The initial disaggregated-params chunk
+/// only confirms bootstrap-room registration and is deliberately not an ACK.
+const PREFILL_COMPLETE_MARKER_KEY: &str = "dynamo_prefill_complete";
+/// Worker runtime-data capability required on both sides of a Layer-2 rebind.
+/// The cold adapter must emit `PREFILL_COMPLETE_MARKER_KEY`, and the published
+/// disaggregated endpoint guarantees PrefillRouter will use its bootstrap path.
+const SESSION_REBIND_CAPABILITY_KEY: &str = "kv_session_rebind_v1";
+
+#[derive(Debug, PartialEq, Eq)]
+enum RebindStreamAction {
+    Forward,
+    SuppressControlFrame,
+    Committed,
+    RolledBack(&'static str),
+    ReplaceWithError(String),
+}
+
+/// Holds a shadow affinity until the cold prefill worker explicitly confirms
+/// that migration or its full-prefill fallback has completed.
+struct RebindResponseGate {
+    pending: Option<SessionRebindGuard>,
+    saw_bootstrap_data: bool,
+    transitions: prometheus::IntCounterVec,
+}
+
+impl RebindResponseGate {
+    fn new(pending: Option<SessionRebindGuard>, transitions: prometheus::IntCounterVec) -> Self {
+        Self {
+            pending,
+            saw_bootstrap_data: false,
+            transitions,
+        }
+    }
+
+    fn observe(&mut self, item: &Annotated<LLMEngineOutput>) -> RebindStreamAction {
+        if self.pending.is_none() {
+            return if item.event.is_none()
+                && item.error.is_none()
+                && item.data.as_ref().is_some_and(is_prefill_complete_marker)
+            {
+                RebindStreamAction::SuppressControlFrame
+            } else {
+                RebindStreamAction::Forward
+            };
+        }
+
+        if item.is_error() || item.error.is_some() {
+            drop(self.pending.take());
+            self.record(RebindTransition::AbortAnnotatedError);
+            return RebindStreamAction::RolledBack("annotated_error");
+        }
+
+        let Some(output) = item.data.as_ref() else {
+            // Annotation-only frames are not proof that the cold prefill ran.
+            return RebindStreamAction::Forward;
+        };
+
+        match output.finish_reason.as_ref() {
+            Some(FinishReason::Error(message)) => {
+                drop(self.pending.take());
+                self.record(RebindTransition::AbortLlmError);
+                return RebindStreamAction::ReplaceWithError(format!(
+                    "cold prefill failed before completion ACK: {message}"
+                ));
+            }
+            Some(FinishReason::Cancelled) => {
+                drop(self.pending.take());
+                self.record(RebindTransition::AbortCancelled);
+                return RebindStreamAction::ReplaceWithError(
+                    "cold prefill was cancelled before completion ACK".to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        if is_prefill_complete_marker(output) {
+            if !self.saw_bootstrap_data {
+                drop(self.pending.take());
+                self.record(RebindTransition::AbortAckBeforeBootstrap);
+                return RebindStreamAction::ReplaceWithError(
+                    "cold prefill completion ACK arrived before bootstrap data".to_string(),
+                );
+            }
+
+            let rebind = self
+                .pending
+                .take()
+                .expect("pending rebind must exist while processing its ACK");
+            return if rebind.commit() {
+                self.record(RebindTransition::CommitPrefillCompleteAck);
+                RebindStreamAction::Committed
+            } else {
+                self.record(RebindTransition::AbortCasConflict);
+                RebindStreamAction::ReplaceWithError(
+                    "session affinity changed before cold prefill completion; refusing to overwrite concurrent affinity"
+                        .to_string(),
+                )
+            };
+        }
+
+        if output.disaggregated_params.is_some() {
+            self.saw_bootstrap_data = true;
+        }
+        RebindStreamAction::Forward
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        self.pending.take()?;
+        self.record(RebindTransition::AbortMissingAck);
+        Some(if self.saw_bootstrap_data {
+            "cold prefill stream ended without a completion ACK".to_string()
+        } else {
+            "cold prefill stream ended before bootstrap data or completion ACK".to_string()
+        })
+    }
+
+    fn cancel(&mut self) -> bool {
+        let cancelled = self.pending.take().is_some();
+        if cancelled {
+            self.record(RebindTransition::AbortContextStopped);
+        }
+        cancelled
+    }
+
+    fn record(&self, transition: RebindTransition) {
+        record_rebind_transition(&self.transitions, transition);
+    }
+}
+
+impl Drop for RebindResponseGate {
+    fn drop(&mut self) {
+        if self.pending.take().is_some() {
+            self.record(RebindTransition::AbortStreamDropped);
+        }
+    }
+}
+
+fn is_prefill_complete_marker(output: &LLMEngineOutput) -> bool {
+    output
+        .extra_args
+        .as_ref()
+        .and_then(|extra_args| extra_args.get(PREFILL_COMPLETE_MARKER_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 /// Base TCP port for SGLang per-rank migration peer channels: source attention
 /// dp_rank `r` binds `MIGRATION_PEER_PORT_BASE + r`. This MUST equal the value
 /// SGLang is launched with (`--prefill-migration-peer-port-base`); a silent
@@ -148,6 +315,31 @@ impl KvPushRouter {
         }
     }
 
+    fn record_rebind_transition(&self, transition: RebindTransition) {
+        RouterRequestMetrics::from_component(self.chooser.client().endpoint.component())
+            .record_rebind_transition(transition);
+    }
+
+    fn worker_supports_session_rebind(&self, worker_id: u64) -> bool {
+        let configs = self.chooser.workers_with_configs.borrow();
+        let Some(config) = configs.get(&worker_id) else {
+            return false;
+        };
+        let advertises_ack = config
+            .runtime_data
+            .get(SESSION_REBIND_CAPABILITY_KEY)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let has_bootstrap_endpoint =
+            config
+                .disaggregated_endpoint
+                .as_ref()
+                .is_some_and(|endpoint| {
+                    endpoint.bootstrap_host.is_some() && endpoint.bootstrap_port.is_some()
+                });
+        advertises_ack && has_bootstrap_endpoint
+    }
+
     async fn select_request(
         &self,
         request: &SingleIn<PreprocessedRequest>,
@@ -155,20 +347,52 @@ impl KvPushRouter {
         is_query_only: bool,
     ) -> Result<WorkerSelection, Error> {
         let context_id = request.context().id().to_string();
+        let preserve_sticky_lifecycle = request
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.session_control.as_ref())
+            .and_then(|session| session.action.as_ref())
+            .is_some();
+        let sticky_binding = self.resolve_sticky_binding_for_phase(
+            &context_id,
+            request,
+            phase,
+            preserve_sticky_lifecycle,
+        )?;
+        let sticky_worker = sticky_binding.map(|token| token.binding.worker);
+
+        self.select_request_inner(
+            request,
+            phase,
+            is_query_only,
+            sticky_worker,
+            true,
+            !preserve_sticky_lifecycle,
+        )
+        .await
+    }
+
+    async fn select_request_for_final_target(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        target: WorkerWithDpRank,
+    ) -> Result<WorkerSelection, Error> {
+        self.select_request_inner(request, phase, false, Some(target), false, false)
+            .await
+    }
+
+    async fn select_request_inner(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        is_query_only: bool,
+        pinned_worker: Option<WorkerWithDpRank>,
+        refresh_sticky: bool,
+        allow_sticky_fallback: bool,
+    ) -> Result<WorkerSelection, Error> {
+        let context_id = request.context().id().to_string();
         let routing_parts = RoutingRequestParts::new(request);
-        let sticky_worker = match self.sticky.worker_for_phase(request, phase) {
-            Some(worker)
-                if self.unbind_ineligible_sticky_worker_for_phase(
-                    &context_id,
-                    request,
-                    phase,
-                    worker,
-                ) =>
-            {
-                None
-            }
-            worker => worker,
-        };
         let request_context = request.context().clone();
         let mut selection_future = Box::pin(async {
             match self
@@ -178,32 +402,49 @@ impl KvPushRouter {
                     routing_parts,
                     phase,
                     is_query_only,
-                    sticky_worker,
+                    pinned_worker,
                 )
                 .instrument(tracing::info_span!("kv_router.select_worker"))
                 .await
             {
                 Ok(selection) => {
-                    if sticky_worker.is_some() && !is_query_only {
+                    if refresh_sticky && pinned_worker.is_some() && !is_query_only {
                         self.sticky.refresh_worker_for_phase(request, phase);
                     }
                     Ok(selection)
                 }
-                Err(error) if sticky_worker.is_some() => {
-                    if let Some(worker) = sticky_worker {
-                        let unbound = self.unbind_ineligible_sticky_worker_for_phase(
-                            &context_id,
-                            request,
-                            phase,
-                            worker,
-                        );
+                Err(error) if allow_sticky_fallback && pinned_worker.is_some() => {
+                    if let Some(worker) = pinned_worker {
+                        let unbound = self
+                            .sticky
+                            .binding_token_for_phase(request, phase)
+                            .filter(|token| token.binding.worker == worker)
+                            .map(|token| {
+                                self.remove_ineligible_sticky_binding_for_phase(
+                                    &context_id,
+                                    request,
+                                    phase,
+                                    token,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if !unbound {
+                            tracing::warn!(
+                                request_id = %context_id,
+                                worker_id = worker.worker_id,
+                                dp_rank = worker.dp_rank,
+                                error = %error,
+                                "Sticky worker routing failed while affinity remains current; \
+                                 refusing a mismatched fallback target"
+                            );
+                            return Err(error);
+                        }
                         tracing::warn!(
                             request_id = %context_id,
                             worker_id = worker.worker_id,
                             dp_rank = worker.dp_rank,
                             error = %error,
-                            unbound_due_to_ineligibility = unbound,
-                            "Sticky worker routing failed; falling back to normal routing"
+                            "Ineligible sticky binding was removed; falling back to normal routing"
                         );
                     }
                     self.select_worker(
@@ -241,6 +482,42 @@ impl KvPushRouter {
                 Err(cancelled_error(&context_id))
             }
         }
+    }
+
+    async fn reject_unexpected_final_target(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        selection: &WorkerSelection,
+        expected: WorkerWithDpRank,
+    ) -> Result<(), Error> {
+        if selection.instance_id == expected.worker_id && selection.dp_rank == expected.dp_rank {
+            return Ok(());
+        }
+
+        let request_id = request.context().id().to_string();
+        if selection.scheduler_tracked
+            && let Err(cleanup_error) = self.chooser.free(&request_id).await
+        {
+            tracing::error!(
+                %request_id,
+                selected_worker_id = selection.instance_id,
+                selected_dp_rank = selection.dp_rank,
+                expected_worker_id = expected.worker_id,
+                expected_dp_rank = expected.dp_rank,
+                %cleanup_error,
+                "Failed to clean up scheduler state after final-target mismatch"
+            );
+        }
+
+        Err(anyhow::anyhow!(
+            "stateful final-target selection mismatch for request {request_id}: \
+             expected worker {} dp_rank {}, got worker {} dp_rank {}",
+            expected.worker_id,
+            expected.dp_rank,
+            selection.instance_id,
+            selection.dp_rank,
+        )
+        .into())
     }
 
     async fn track_selection(
@@ -336,6 +613,8 @@ impl KvPushRouter {
         selection: WorkerSelection,
         mut guard: RequestGuard,
         exact: bool,
+        mut pending_rebind: Option<SessionRebindGuard>,
+        session_turn: Option<SessionTurnGuard>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let context_id = request.context().id().to_string();
         let request_context = request.context().clone();
@@ -358,6 +637,10 @@ impl KvPushRouter {
         let route_outcome = match route_outcome {
             Ok(outcome) => outcome,
             Err(error) => {
+                if pending_rebind.is_some() {
+                    self.record_rebind_transition(RebindTransition::AbortRouteError);
+                }
+                drop(pending_rebind.take());
                 guard.abort().await;
                 return Err(error);
             }
@@ -401,6 +684,10 @@ impl KvPushRouter {
                 if let Some(rollback) = rollback.take() {
                     self.sticky.rollback_routed(rollback, &context_id);
                 }
+                if pending_rebind.is_some() {
+                    self.record_rebind_transition(RebindTransition::AbortDispatchError);
+                }
+                drop(pending_rebind.take());
                 guard.abort().await;
                 return Err(error);
             }
@@ -411,12 +698,22 @@ impl KvPushRouter {
         let context_for_monitoring = stream_context.clone();
         let wrapped_stream = Box::pin(async_stream::stream! {
             let mut guard = guard;
+            let session_turn = session_turn;
+            let transitions = guard.request_metrics().rebind_transitions_total.clone();
+            let mut rebind_gate = RebindResponseGate::new(pending_rebind.take(), transitions);
 
             loop {
                 tokio::select! {
                     biased;
 
                     _ = context_for_monitoring.stopped() => {
+                        if rebind_gate.cancel() {
+                            tracing::info!(
+                                request_id = %context_id,
+                                reason = "context_stopped",
+                                "Rolled back shadow session rebind"
+                            );
+                        }
                         tracing::debug!("Request {context_id} cancelled, ending stream");
                         break;
                     }
@@ -425,37 +722,94 @@ impl KvPushRouter {
                         let Some(item) = item else {
                             break;
                         };
-                        guard.on_item(&item).await;
-                        yield item;
+                        match rebind_gate.observe(&item) {
+                            RebindStreamAction::Forward => {
+                                guard.on_item(&item).await;
+                                yield item;
+                            }
+                            RebindStreamAction::SuppressControlFrame => {}
+                            RebindStreamAction::Committed => {
+                                tracing::info!(
+                                    request_id = %context_id,
+                                    reason = "prefill_complete_ack",
+                                    "Committed shadow session rebind"
+                                );
+                                // Internal control frame: do not expose it to
+                                // PrefillRouter or client-facing processing.
+                            }
+                            RebindStreamAction::RolledBack(reason) => {
+                                tracing::info!(
+                                    request_id = %context_id,
+                                    reason,
+                                    "Rolled back shadow session rebind"
+                                );
+                                guard.on_item(&item).await;
+                                yield item;
+                            }
+                            RebindStreamAction::ReplaceWithError(message) => {
+                                tracing::warn!(
+                                    request_id = %context_id,
+                                    reason = "invalid_prefill_completion",
+                                    error = %message,
+                                    "Rolled back shadow session rebind"
+                                );
+                                let error = Annotated::from_error(message);
+                                guard.on_item(&error).await;
+                                yield error;
+                                break;
+                            }
+                        }
                     }
                 }
             }
 
+            if let Some(message) = rebind_gate.finish() {
+                tracing::warn!(
+                    request_id = %context_id,
+                    reason = "missing_prefill_complete_ack",
+                    error = %message,
+                    "Rolled back shadow session rebind"
+                );
+                let error = Annotated::from_error(message);
+                guard.on_item(&error).await;
+                yield error;
+            }
+
             guard.finish().await;
+            drop(session_turn);
         });
         Ok(ResponseStream::new(wrapped_stream, stream_context))
     }
 
-    /// Layer-2 KV-migration: if the sticky-pinned (hot) rank is overloaded
-    /// relative to the coldest eligible rank, rebind the session to the cold
-    /// rank and return `(old_hot, cold)` so the caller can redirect the
-    /// dispatch and inject `migrate_from`. Returns `None` when no rebind fires
-    /// (non-prefill phase, no sticky session, within hysteresis, or in
-    /// cooldown).
+    /// Layer-2 KV-migration read-only decision. If the sticky-pinned (hot) rank
+    /// is overloaded relative to the coldest eligible rank, return the proposed
+    /// final target without mutating sticky state or scheduler accounting.
+    /// Returns `None` for a non-prefill phase, a first/unbound turn, a load gap
+    /// within hysteresis, or an active cooldown.
     ///
     /// Runs on the LIVE prefill path (`select_and_dispatch_prefill`), the only
     /// place with both `self.sticky` and `self.chooser` load data in scope.
-    async fn check_and_trigger_rebind(
+    async fn check_rebind_decision(
         &self,
         request: &SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
-        hot: WorkerWithDpRank,
-    ) -> Option<(WorkerWithDpRank, WorkerWithDpRank)> {
+        expected: Option<AffinityBindingToken>,
+    ) -> Option<RebindDecision> {
         if phase != RequestPhase::Prefill {
             return None;
         }
+        // Rebind is a data-plane optimization for ordinary session turns.
+        // Lifecycle actions must reach the currently visible binding so Open,
+        // Bind, and Close cannot race a shadow transition.
+        let session_control = request.routing.as_ref()?.session_control.as_ref()?;
+        if session_control.action.is_some() {
+            return None;
+        }
         // Phase-gated sticky session id; also confirms session_control exists.
-        let session_id = self.sticky.session_id_for_phase(request, phase)?.to_string();
+        let session_id = self
+            .sticky
+            .session_id_for_phase(request, phase)?
+            .to_string();
         // DIAG (bounded to sticky requests only): confirms nvext.session_control
         // round-tripped into routing and reached the live rebind check.
         tracing::info!(
@@ -463,16 +817,21 @@ impl KvPushRouter {
             "Layer-2 diag: sticky prefill reached rebind check (session_control present)"
         );
 
-        // F1: only rebind an EXISTING binding (affinity HIT). A brand-new
-        // session's first turn carries session_control but has no prior home
-        // rank — there is nothing to migrate FROM. `hot` is the freshly-selected
-        // worker, not proof of a prior sticky home, so it cannot substitute for
-        // this check. `worker_for_phase` -> `peek_session` is side-effect-free
-        // (does NOT refresh TTL), so gating here is observationally pure.
-        if self.sticky.worker_for_phase(request, phase).is_none() {
+        // Only a stable existing binding is eligible. The revision captured here
+        // is the CAS condition used after the final-target scheduler booking.
+        let Some(expected) = expected else {
             tracing::info!(
                 %session_id,
-                "Layer-2 diag: no prior sticky binding (first turn / unbound) — skip rebind"
+                "Layer-2 diag: no stable prior binding (first turn / pending transition) — skip rebind"
+            );
+            return None;
+        };
+        let hot = expected.binding.worker;
+        if !self.worker_supports_session_rebind(hot.worker_id) {
+            tracing::debug!(
+                %session_id,
+                hot_worker_id = hot.worker_id,
+                "Layer-2 rebind skipped: hot worker does not advertise the completion-ACK capability"
             );
             return None;
         }
@@ -499,6 +858,15 @@ impl KvPushRouter {
         let cold = loads
             .iter()
             .filter(|l| !(l.worker_id == hot.worker_id && l.dp_rank == hot.dp_rank))
+            .filter(|load| {
+                let candidate = WorkerWithDpRank::new(load.worker_id, load.dp_rank);
+                (expected.binding.kind != AffinityKind::EngineBacked
+                    || candidate.worker_id == hot.worker_id)
+                    && self.worker_supports_session_rebind(candidate.worker_id)
+                    && self
+                        .worker_ineligibility_for_phase(request, phase, candidate)
+                        .is_none()
+            })
             .min_by_key(|l| l.potential_prefill_tokens)?;
 
         // Hysteresis: only rebind when the hot rank is meaningfully hotter.
@@ -531,31 +899,26 @@ impl KvPushRouter {
             .map(|sc| Duration::from_secs(sc.timeout))
             .unwrap_or(REBIND_DEFAULT_TTL);
 
-        // F3: the store.put inside rebind() is immediately overwritten by the
-        // identical on_routed() bind once `selection` is redirected to the cold
-        // rank by the caller (dispatch_selection -> on_routed -> bind, same
-        // store key). Only the last_rebind COOLDOWN STAMP set by rebind() is
-        // load-bearing here. The double-put is intentional/harmless, not a bug;
-        // do not "optimize" it away without first moving the cooldown stamp into
-        // on_routed (rebind() has dedicated tests in sticky/router.rs that a
-        // split would force-update).
         let cold_target = WorkerWithDpRank::new(cold.worker_id, cold.dp_rank);
-        let old = self.sticky.rebind(&session_id, cold_target, ttl);
-        let old_hot = old.unwrap_or(hot);
-
-        // G2: confirm at runtime that this LIVE branch fires.
-        tracing::info!(
-            %session_id,
-            hot_worker_id = old_hot.worker_id,
-            hot_dp_rank = old_hot.dp_rank,
-            hot_potential_prefill_tokens = hot_load,
-            cold_worker_id = cold_target.worker_id,
-            cold_dp_rank = cold_target.dp_rank,
-            cold_potential_prefill_tokens = cold.potential_prefill_tokens,
-            "Layer-2 rebind fired on live prefill path (select_and_dispatch_prefill)"
-        );
-
-        Some((old_hot, cold_target))
+        if expected.binding.kind == AffinityKind::EngineBacked
+            && hot.worker_id != cold_target.worker_id
+        {
+            tracing::warn!(
+                %session_id,
+                hot_worker_id = hot.worker_id,
+                hot_dp_rank = hot.dp_rank,
+                cold_worker_id = cold_target.worker_id,
+                cold_dp_rank = cold_target.dp_rank,
+                "Layer-2 rebind skipped: engine-backed cross-worker transition requires lifecycle RPC"
+            );
+            return None;
+        }
+        Some(RebindDecision {
+            session_id,
+            expected,
+            cold: cold_target,
+            ttl,
+        })
     }
 
     /// Resolve the source (hot) worker's deterministic SGLang migration peer
@@ -606,6 +969,120 @@ impl KvPushRouter {
         Some(format!("tcp://{migration_socket}"))
     }
 
+    fn attach_migrate_from(
+        &self,
+        request: &mut SingleIn<PreprocessedRequest>,
+        session_id: &str,
+        old_hot: WorkerWithDpRank,
+        cold: WorkerWithDpRank,
+    ) {
+        // Migration is currently safe by default only for an intra-worker
+        // cross-dp-rank rebind. Cross-worker routing still keeps the cold target,
+        // but omits KV reuse unless a topology-specific host override is explicit.
+        let intra_worker = old_hot.worker_id == cold.worker_id;
+        if !intra_worker && migration_peer_host_override().is_none() {
+            warn_cross_worker_migration_skipped(old_hot, cold);
+            return;
+        }
+
+        match self.resolve_migration_endpoint(old_hot) {
+            Some(source_endpoint) => {
+                request.migrate_from = Some(MigrateFrom {
+                    source_endpoint,
+                    source_dp_rank: old_hot.dp_rank,
+                    session_id: session_id.to_string(),
+                });
+            }
+            None => {
+                tracing::warn!(
+                    hot_worker_id = old_hot.worker_id,
+                    hot_dp_rank = old_hot.dp_rank,
+                    "Layer-2 rebind: could not resolve source migration endpoint \
+                     (non-TCP request plane, or source worker gone); proceeding with \
+                     the cold-rank rebind but without a migrate_from directive"
+                );
+            }
+        }
+    }
+
+    async fn select_prefill_request(
+        &self,
+        request: &mut SingleIn<PreprocessedRequest>,
+    ) -> Result<PrefillSelection, Error> {
+        let phase = RequestPhase::Prefill;
+        let context_id = request.context().id().to_string();
+        let session_turn = self
+            .sticky
+            .acquire_turn_for_phase(request, phase, &context_id)?;
+        if request
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.session_control.as_ref())
+            .and_then(|session| session.action.as_ref())
+            .is_some()
+        {
+            return Ok(PrefillSelection {
+                selection: self.select_request(request, phase, false).await?,
+                pending_rebind: None,
+                session_turn,
+            });
+        }
+        let hot_binding =
+            self.resolve_sticky_binding_for_phase(&context_id, request, phase, false)?;
+        let expected = hot_binding.and_then(|binding| {
+            self.sticky
+                .rebind_token_for_phase(request, phase)
+                .filter(|token| *token == binding)
+        });
+        let Some(decision) = self.check_rebind_decision(request, phase, expected).await else {
+            return Ok(PrefillSelection {
+                selection: self.select_request(request, phase, false).await?,
+                pending_rebind: None,
+                session_turn,
+            });
+        };
+
+        // The decision is deliberately read-only. Book exactly once, explicitly
+        // against the final cold target; only a successful, matching booking may
+        // publish the sticky rebind and the migrate_from directive.
+        let selection = self
+            .select_request_for_final_target(request, phase, decision.cold)
+            .await?;
+        self.reject_unexpected_final_target(request, &selection, decision.cold)
+            .await?;
+
+        let Some(pending_rebind) = self.sticky.begin_rebind(
+            &decision.session_id,
+            decision.expected,
+            decision.cold,
+            decision.ttl,
+        ) else {
+            if selection.scheduler_tracked
+                && let Err(cleanup_error) = self.chooser.free(&context_id).await
+            {
+                tracing::error!(
+                    request_id = %context_id,
+                    %cleanup_error,
+                    "Failed to clean up scheduler state after rebind CAS rejection"
+                );
+            }
+            return Err(anyhow::anyhow!(
+                "session {} changed while preparing rebind; refusing stale cold dispatch",
+                decision.session_id
+            )
+            .into());
+        };
+
+        let hot = decision.expected.binding.worker;
+        self.record_rebind_transition(RebindTransition::DecisionLoadImbalance);
+        self.attach_migrate_from(request, &decision.session_id, hot, decision.cold);
+        Ok(PrefillSelection {
+            selection,
+            pending_rebind: Some(pending_rebind),
+            session_turn,
+        })
+    }
+
     pub(crate) async fn select_and_dispatch_prefill<M, F>(
         &self,
         mut request: SingleIn<PreprocessedRequest>,
@@ -617,76 +1094,43 @@ impl KvPushRouter {
         let phase = RequestPhase::Prefill;
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
-        let mut selection = self.select_request(&request, phase, false).await?;
+        let PrefillSelection {
+            mut selection,
+            pending_rebind,
+            session_turn,
+        } = self.select_prefill_request(&mut request).await?;
 
-        // --- Layer-2 KV-migration rebind hook (LIVE prefill path) ---
-        // `selection` is the single value consumed by both `prepare` (below)
-        // and `dispatch_selection`; overwriting it redirects the REAL forwarded
-        // request, not a dead branch (G2). The OLD/hot source rides on
-        // `request.migrate_from` because `prepare` only receives the cold rank.
-        let hot = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
-        if let Some((old_hot, cold)) = self.check_and_trigger_rebind(&request, phase, hot).await {
-            // Redirect the REAL forwarded request to the cold rank regardless of
-            // whether we can build a migrate_from directive (the rebind itself
-            // is the load-balancing action; migrate_from is the KV-reuse
-            // optimization on top of it).
-            selection.instance_id = cold.worker_id;
-            selection.dp_rank = cold.dp_rank;
-
-            // Migration directive is only meaningful for an INTRA-WORKER rebind:
-            // source `old_hot` and target `cold` on the same worker = same node, so
-            // the host-agnostic 0.0.0.0 sentinel resolves correctly to the source
-            // host on the SGLang side (the target's own local IP). A cross-worker
-            // rebind's source host is genuinely remote and unknowable under a NATS
-            // request plane, so we skip the directive — keeping the load-balancing
-            // rebind — unless an explicit DYN_MIGRATION_PEER_HOST opts into a known
-            // topology. (Cross-worker migration would need per-worker endpoint
-            // advertisement; tracked as a follow-up.)
-            let intra_worker = old_hot.worker_id == cold.worker_id;
-            if !intra_worker && migration_peer_host_override().is_none() {
-                warn_cross_worker_migration_skipped(old_hot, cold);
-            } else {
-                // Resolve the source (hot) worker_id -> host via the registry, then
-                // build the deterministic SGLang migration peer endpoint. May be
-                // None in NATS request-plane mode or if the source worker is gone.
-                match self.resolve_migration_endpoint(old_hot) {
-                    Some(source_endpoint) => {
-                        let session_id = self
-                            .sticky
-                            .session_id_for_phase(&request, phase)
-                            .map(str::to_string)
-                            .unwrap_or_default();
-                        request.migrate_from = Some(MigrateFrom {
-                            source_endpoint,
-                            source_dp_rank: old_hot.dp_rank,
-                            session_id,
-                        });
-                    }
-                    None => {
-                        tracing::warn!(
-                            hot_worker_id = old_hot.worker_id,
-                            hot_dp_rank = old_hot.dp_rank,
-                            "Layer-2 rebind: could not resolve source migration endpoint \
-                             (non-TCP request plane, or source worker gone); proceeding with \
-                             the cold-rank rebind but without a migrate_from directive"
-                        );
-                    }
+        let mut guard = match self.track_selection(&request, &mut selection).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                if pending_rebind.is_some() {
+                    self.record_rebind_transition(RebindTransition::AbortTrackingError);
                 }
+                drop(pending_rebind);
+                return Err(error);
             }
-        }
-        // --- end rebind hook ---
-
-        let mut guard = self.track_selection(&request, &mut selection).await?;
+        };
         let metadata = match prepare(&mut request, selection.instance_id, Some(selection.dp_rank)) {
             Ok(metadata) => metadata,
             Err(error) => {
+                if pending_rebind.is_some() {
+                    self.record_rebind_transition(RebindTransition::AbortPrepareError);
+                }
+                drop(pending_rebind);
                 guard.abort().await;
                 return Err(error);
             }
         };
         drop(route_guard);
         let stream = self
-            .dispatch_selection(request, selection, guard, true)
+            .dispatch_selection(
+                request,
+                selection,
+                guard,
+                true,
+                pending_rebind,
+                session_turn,
+            )
             .await?;
         Ok((metadata, stream))
     }
@@ -775,7 +1219,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
         let guard = self.track_selection(&request, &mut selection).await?;
         drop(route_guard);
-        self.dispatch_selection(request, selection, guard, false)
+        self.dispatch_selection(request, selection, guard, false, None, None)
             .await
     }
 }
@@ -822,5 +1266,955 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         tracing::debug!(worker_id = worker_id, "Direct routing to specified worker");
 
         self.inner.direct(request, worker_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use dynamo_kv_router::config::KvRouterConfig;
+    use dynamo_runtime::{
+        DistributedRuntime, Runtime,
+        distributed::DistributedConfig,
+        pipeline::{Context, RouterMode},
+    };
+    use tokio::sync::watch;
+
+    use super::*;
+    use crate::{
+        discovery::WORKER_TYPE_PREFILL,
+        kv_router::scheduler::DefaultWorkerSelector,
+        local_model::runtime_config::{DisaggregatedEndpoint, ModelRuntimeConfig},
+        protocols::common::{
+            extensions::{SessionAction, SessionControl},
+            preprocessor::RoutingHints,
+            timing::RequestTracker,
+        },
+    };
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn session_request(
+        session_id: &str,
+        action: Option<SessionAction>,
+        tokens: usize,
+    ) -> PreprocessedRequest {
+        PreprocessedRequest::builder()
+            .model("test-model".to_string())
+            .token_ids(vec![7; tokens])
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .routing(Some(RoutingHints {
+                session_control: Some(SessionControl {
+                    session_id: session_id.to_string(),
+                    action,
+                    timeout: 300,
+                }),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap()
+    }
+
+    async fn make_dp_test_router_with_capability(
+        worker_ids: &[u64],
+        supports_rebind: bool,
+    ) -> KvPushRouter {
+        let runtime = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(runtime, DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let namespace = drt
+            .namespace(format!("test-rebind-final-target-{test_id}"))
+            .unwrap();
+        let component = namespace.component("router").unwrap();
+        let endpoint = component.endpoint("backend");
+        let client = endpoint.client().await.unwrap();
+
+        let worker_configs = worker_ids
+            .iter()
+            .map(|worker_id| {
+                let mut worker_config = ModelRuntimeConfig::default();
+                worker_config.data_parallel_size = 2;
+                if supports_rebind {
+                    worker_config.runtime_data.insert(
+                        SESSION_REBIND_CAPABILITY_KEY.to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    worker_config.disaggregated_endpoint = Some(DisaggregatedEndpoint {
+                        bootstrap_host: Some("127.0.0.1".to_string()),
+                        bootstrap_port: Some(18000),
+                    });
+                }
+                (*worker_id, worker_config)
+            })
+            .collect();
+        let (_tx, workers) = watch::channel(worker_configs);
+
+        let config = KvRouterConfig {
+            overlap_score_credit: 0.0,
+            router_temperature: 0.0,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            router_track_prefill_tokens: true,
+            skip_initial_worker_wait: true,
+            ..Default::default()
+        };
+        let selector = DefaultWorkerSelector::new(Some(config.clone()), WORKER_TYPE_PREFILL);
+        let chooser = Arc::new(
+            KvRouter::new(
+                endpoint,
+                client.clone(),
+                workers,
+                16,
+                selector,
+                Some(config),
+                None,
+                WORKER_TYPE_PREFILL,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let inner = PushRouter::from_client(client, RouterMode::KV)
+            .await
+            .unwrap();
+        KvPushRouter::new(inner, chooser)
+    }
+
+    async fn make_dp_test_router_with_workers(worker_ids: &[u64]) -> KvPushRouter {
+        make_dp_test_router_with_capability(worker_ids, true).await
+    }
+
+    async fn make_dp_test_router() -> KvPushRouter {
+        make_dp_test_router_with_workers(&[42]).await
+    }
+
+    async fn load_snapshot(router: &KvPushRouter) -> HashMap<WorkerWithDpRank, (usize, usize)> {
+        router
+            .chooser
+            .get_potential_loads(&[], None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|load| {
+                (
+                    WorkerWithDpRank::new(load.worker_id, load.dp_rank),
+                    (load.potential_prefill_tokens, load.active_requests),
+                )
+            })
+            .collect()
+    }
+
+    async fn make_rebind_response_gate(
+        router: &KvPushRouter,
+        session_id: &str,
+        hot: WorkerWithDpRank,
+        cold: WorkerWithDpRank,
+    ) -> RebindResponseGate {
+        let bind_request = session_request(session_id, Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, &format!("bind-{session_id}"))
+            .await
+            .unwrap();
+
+        let request = session_request(session_id, None, 1);
+        let expected = router
+            .sticky
+            .rebind_token_for_phase(&request, RequestPhase::Prefill)
+            .unwrap();
+        let pending = router
+            .sticky
+            .begin_rebind(session_id, expected, cold, Duration::from_secs(300))
+            .unwrap();
+        let transitions =
+            RouterRequestMetrics::from_component(router.chooser.client().endpoint.component())
+                .rebind_transitions_total
+                .clone();
+        RebindResponseGate::new(Some(pending), transitions)
+    }
+
+    fn visible_affinity(router: &KvPushRouter, session_id: &str) -> Option<WorkerWithDpRank> {
+        router
+            .sticky
+            .worker_for_phase(&session_request(session_id, None, 1), RequestPhase::Prefill)
+    }
+
+    fn prefill_bootstrap_output() -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput {
+            disaggregated_params: Some(serde_json::json!({
+                "bootstrap_host": "127.0.0.1",
+                "bootstrap_port": 1234,
+                "bootstrap_room": 5678,
+            })),
+            ..Default::default()
+        })
+    }
+
+    fn prefill_complete_marker() -> Annotated<LLMEngineOutput> {
+        Annotated::from_data(LLMEngineOutput {
+            extra_args: Some(serde_json::json!({
+                "dynamo_prefill_complete": true,
+            })),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn rebind_response_gate_commits_only_after_bootstrap_and_completion_marker() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "response-gate-success";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+
+        assert_eq!(
+            gate.observe(&prefill_bootstrap_output()),
+            RebindStreamAction::Forward
+        );
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+
+        assert_eq!(
+            gate.observe(&prefill_complete_marker()),
+            RebindStreamAction::Committed
+        );
+        assert_eq!(visible_affinity(&router, session_id), Some(cold));
+        assert!(gate.finish().is_none());
+    }
+
+    #[tokio::test]
+    async fn rebind_response_gate_rolls_back_on_first_annotated_error() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "response-gate-first-error";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+
+        assert_eq!(
+            gate.observe(&Annotated::from_error("prefill failed")),
+            RebindStreamAction::RolledBack("annotated_error")
+        );
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+        assert!(gate.finish().is_none());
+    }
+
+    #[tokio::test]
+    async fn rebind_response_gate_rejects_empty_stream() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "response-gate-empty";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+
+        let error = gate.finish().expect("empty stream must fail closed");
+        assert!(error.contains("before bootstrap data"));
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+    }
+
+    #[tokio::test]
+    async fn rebind_response_gate_rolls_back_on_cancel_before_bootstrap() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "response-gate-cancel";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+
+        let action = gate.observe(&Annotated::from_data(LLMEngineOutput::cancelled()));
+        assert!(matches!(action, RebindStreamAction::ReplaceWithError(_)));
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+        assert!(gate.finish().is_none());
+    }
+
+    #[tokio::test]
+    async fn rebind_response_gate_cas_failure_preserves_concurrent_affinity() {
+        let router = make_dp_test_router_with_workers(&[42, 99]).await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let concurrent = WorkerWithDpRank::new(99, 0);
+        let session_id = "response-gate-cas";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+        assert_eq!(
+            gate.observe(&prefill_bootstrap_output()),
+            RebindStreamAction::Forward
+        );
+
+        let concurrent_bind = session_request(session_id, Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&concurrent_bind, concurrent, "concurrent-bind")
+            .await
+            .unwrap();
+        assert_eq!(visible_affinity(&router, session_id), Some(concurrent));
+
+        let action = gate.observe(&prefill_complete_marker());
+        assert!(matches!(action, RebindStreamAction::ReplaceWithError(_)));
+        assert_eq!(visible_affinity(&router, session_id), Some(concurrent));
+        assert!(gate.finish().is_none());
+    }
+
+    #[tokio::test]
+    async fn rebind_response_gate_keeps_cold_after_later_error() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "response-gate-later-error";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+
+        assert_eq!(
+            gate.observe(&prefill_bootstrap_output()),
+            RebindStreamAction::Forward
+        );
+        assert_eq!(
+            gate.observe(&prefill_complete_marker()),
+            RebindStreamAction::Committed
+        );
+        assert_eq!(
+            gate.observe(&Annotated::from_error("late failure")),
+            RebindStreamAction::Forward
+        );
+        assert_eq!(visible_affinity(&router, session_id), Some(cold));
+    }
+
+    #[tokio::test]
+    async fn rebind_response_gate_does_not_accept_marker_after_unrelated_data() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "response-gate-no-bootstrap";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+
+        assert_eq!(
+            gate.observe(&Annotated::from_data(LLMEngineOutput::default())),
+            RebindStreamAction::Forward
+        );
+        let action = gate.observe(&prefill_complete_marker());
+        assert!(matches!(action, RebindStreamAction::ReplaceWithError(_)));
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+    }
+
+    #[tokio::test]
+    async fn rebind_skips_session_lifecycle_actions() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        router
+            .chooser
+            .add_request(
+                "lifecycle-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+
+        for (index, action) in [
+            SessionAction::Open,
+            SessionAction::Bind,
+            SessionAction::Close,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("lifecycle-session-{index}");
+            let bind_request = session_request(&session_id, Some(SessionAction::Bind), 1);
+            router
+                .sticky
+                .on_routed(&bind_request, hot, &format!("bind-{session_id}"))
+                .await
+                .unwrap();
+
+            let mut request_data = session_request(&session_id, Some(action), 128);
+            let routing = request_data.routing.as_mut().unwrap();
+            routing.allowed_worker_ids = Some(HashSet::from([999]));
+            routing.prefill_worker_id = Some(999);
+            routing.prefill_dp_rank = Some(0);
+            let mut request = Context::with_id_and_metadata(
+                request_data,
+                format!("lifecycle-request-{index}"),
+                Default::default(),
+            );
+            let expected = router
+                .sticky
+                .rebind_token_for_phase(&request, RequestPhase::Prefill);
+
+            assert!(
+                router
+                    .check_rebind_decision(&request, RequestPhase::Prefill, expected)
+                    .await
+                    .is_none(),
+                "session lifecycle action must not trigger a rebind"
+            );
+            let PrefillSelection {
+                selection,
+                pending_rebind,
+                session_turn: _session_turn,
+            } = router.select_prefill_request(&mut request).await.unwrap();
+            assert!(pending_rebind.is_none());
+            assert_eq!(selection.instance_id, hot.worker_id);
+            assert_eq!(selection.dp_rank, hot.dp_rank);
+            assert_eq!(
+                router
+                    .sticky
+                    .worker_for_phase(&request, RequestPhase::Prefill),
+                Some(hot)
+            );
+            router.chooser.free(request.context().id()).await.unwrap();
+        }
+
+        router.chooser.free("lifecycle-hot-load").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebind_requires_worker_completion_ack_capability() {
+        let router = make_dp_test_router_with_capability(&[42], false).await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        router
+            .chooser
+            .add_request(
+                "capability-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+        let bind_request = session_request("capability-session", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-capability-session")
+            .await
+            .unwrap();
+        let request_data = session_request("capability-session", None, 128);
+        let request = Context::with_id_and_metadata(
+            request_data,
+            "capability-request".to_string(),
+            Default::default(),
+        );
+        let expected = router
+            .sticky
+            .rebind_token_for_phase(&request, RequestPhase::Prefill);
+
+        assert!(
+            router
+                .check_rebind_decision(&request, RequestPhase::Prefill, expected)
+                .await
+                .is_none(),
+            "a worker without the ACK capability must never enter shadow rebind"
+        );
+        router.chooser.free("capability-hot-load").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_session_turn_is_rejected_while_rebind_is_pending_then_released() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        router
+            .chooser
+            .add_request(
+                "serialized-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+        let bind_request = session_request("serialized-session", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-serialized-session")
+            .await
+            .unwrap();
+
+        let mut first = Context::with_id_and_metadata(
+            session_request("serialized-session", None, 128),
+            "serialized-first".to_string(),
+            Default::default(),
+        );
+        let PrefillSelection {
+            pending_rebind,
+            session_turn,
+            ..
+        } = router.select_prefill_request(&mut first).await.unwrap();
+        assert!(pending_rebind.is_some());
+
+        let mut pinned_request = session_request("serialized-session", None, 64);
+        let routing = pinned_request.routing.as_mut().unwrap();
+        routing.prefill_worker_id = Some(hot.worker_id);
+        routing.prefill_dp_rank = Some(hot.dp_rank);
+        let mut second = Context::with_id_and_metadata(
+            pinned_request,
+            "serialized-second".to_string(),
+            Default::default(),
+        );
+        let error = match router.select_prefill_request(&mut second).await {
+            Ok(_) => panic!("concurrent turn unexpectedly acquired the session"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("already has an in-flight prefill turn"));
+
+        let mut backend_pinned_request = session_request("serialized-session", None, 64);
+        let routing = backend_pinned_request.routing.as_mut().unwrap();
+        routing.backend_instance_id = Some(hot.worker_id);
+        routing.dp_rank = Some(hot.dp_rank);
+        let mut backend_pinned = Context::with_id_and_metadata(
+            backend_pinned_request,
+            "serialized-backend-pinned".to_string(),
+            Default::default(),
+        );
+        let error = match router.select_prefill_request(&mut backend_pinned).await {
+            Ok(_) => panic!("backend-pinned turn unexpectedly acquired the session"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("already has an in-flight prefill turn"));
+        assert_eq!(
+            router
+                .sticky
+                .worker_for_phase(&first, RequestPhase::Prefill),
+            Some(hot)
+        );
+
+        drop(pending_rebind);
+        drop(session_turn);
+        router.chooser.free("serialized-first").await.unwrap();
+
+        let PrefillSelection {
+            selection,
+            pending_rebind,
+            session_turn,
+        } = router.select_prefill_request(&mut second).await.unwrap();
+        assert_eq!(selection.instance_id, hot.worker_id);
+        assert_eq!(selection.dp_rank, hot.dp_rank);
+        assert!(pending_rebind.is_none());
+        assert!(session_turn.is_some());
+        drop(session_turn);
+        router.chooser.free("serialized-second").await.unwrap();
+        router.chooser.free("serialized-hot-load").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actionless_session_turn_rejection_preserves_accounting_and_allows_reacquire() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        router
+            .chooser
+            .add_request(
+                "actionless-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+        let bind_request = session_request("actionless-session", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-actionless-session")
+            .await
+            .unwrap();
+
+        let mut first = Context::with_id_and_metadata(
+            session_request("actionless-session", None, 128),
+            "actionless-first".to_string(),
+            Default::default(),
+        );
+        let PrefillSelection {
+            pending_rebind: first_rebind,
+            session_turn: first_turn,
+            ..
+        } = router.select_prefill_request(&mut first).await.unwrap();
+        assert!(first_rebind.is_some());
+        assert!(first_turn.is_some());
+        let held_snapshot = load_snapshot(&router).await;
+
+        let mut second = Context::with_id_and_metadata(
+            session_request("actionless-session", None, 64),
+            "actionless-second".to_string(),
+            Default::default(),
+        );
+        let error = match router.select_prefill_request(&mut second).await {
+            Ok(_) => panic!("concurrent actionless turn unexpectedly acquired the session"),
+            Err(error) => error,
+        };
+        let typed = error
+            .downcast_ref::<dynamo_runtime::error::DynamoError>()
+            .expect("concurrent session turn must return a typed client error");
+        assert_eq!(
+            typed.error_type(),
+            dynamo_runtime::error::ErrorType::InvalidArgument
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("already has an in-flight prefill turn")
+        );
+        assert!(error.to_string().contains("actionless-first"));
+        assert_eq!(
+            load_snapshot(&router).await,
+            held_snapshot,
+            "a rejected turn must not add a second scheduler booking"
+        );
+
+        drop(first_rebind);
+        drop(first_turn);
+        router.chooser.free("actionless-first").await.unwrap();
+        let released_snapshot = load_snapshot(&router).await;
+
+        let PrefillSelection {
+            pending_rebind: retry_rebind,
+            session_turn: retry_turn,
+            ..
+        } = router.select_prefill_request(&mut second).await.unwrap();
+        assert!(retry_rebind.is_some());
+        assert!(retry_turn.is_some());
+        drop(retry_rebind);
+        drop(retry_turn);
+        router.chooser.free("actionless-second").await.unwrap();
+        assert_eq!(
+            load_snapshot(&router).await,
+            released_snapshot,
+            "retry booking must be released exactly once"
+        );
+
+        router.chooser.free("actionless-hot-load").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebind_chooses_coldest_eligible_target() {
+        let router = make_dp_test_router_with_workers(&[42, 99]).await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let eligible_cold = WorkerWithDpRank::new(42, 1);
+        router
+            .chooser
+            .add_request(
+                "eligible-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+        router
+            .chooser
+            .add_request(
+                "eligible-cold-load".to_string(),
+                &vec![1; 1024],
+                None,
+                0,
+                None,
+                eligible_cold,
+                None,
+                None,
+            )
+            .await;
+
+        let bind_request = session_request("eligible-session", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-eligible-session")
+            .await
+            .unwrap();
+
+        let mut request_data = session_request("eligible-session", None, 128);
+        request_data.routing.as_mut().unwrap().allowed_worker_ids = Some(HashSet::from([42]));
+        let mut request = Context::with_id_and_metadata(
+            request_data,
+            "eligible-rebind-request".to_string(),
+            Default::default(),
+        );
+
+        let PrefillSelection {
+            selection,
+            pending_rebind,
+            session_turn: _session_turn,
+        } = router.select_prefill_request(&mut request).await.unwrap();
+        assert_eq!(selection.instance_id, eligible_cold.worker_id);
+        assert_eq!(selection.dp_rank, eligible_cold.dp_rank);
+        drop(pending_rebind);
+
+        router
+            .chooser
+            .free("eligible-rebind-request")
+            .await
+            .unwrap();
+        router.chooser.free("eligible-hot-load").await.unwrap();
+        router.chooser.free("eligible-cold-load").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebind_books_and_tracks_only_the_final_cold_target() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+
+        let hot_tokens = vec![1; 8192];
+        router
+            .chooser
+            .add_request(
+                "existing-hot-load".to_string(),
+                &hot_tokens,
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+
+        let bind_request = session_request("session-a", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-session-a")
+            .await
+            .unwrap();
+
+        let before = load_snapshot(&router).await;
+        assert_eq!(before[&hot], (8192, 1));
+        assert_eq!(before[&cold], (0, 0));
+
+        let tracker = Arc::new(RequestTracker::new());
+        let phase_permit = tracker.set_phase(RequestPhase::Prefill).await;
+        let mut request_data = session_request("session-a", None, 128);
+        request_data.tracker = Some(tracker.clone());
+        let mut request = Context::with_id_and_metadata(
+            request_data,
+            "rebind-request".to_string(),
+            Default::default(),
+        );
+
+        let PrefillSelection {
+            mut selection,
+            pending_rebind,
+            session_turn: _session_turn,
+        } = router.select_prefill_request(&mut request).await.unwrap();
+        assert_eq!(selection.instance_id, cold.worker_id);
+        assert_eq!(selection.dp_rank, cold.dp_rank);
+        assert_eq!(
+            router
+                .sticky
+                .worker_for_phase(&request, RequestPhase::Prefill),
+            Some(hot),
+            "the cold target must remain shadowed until dispatch succeeds"
+        );
+
+        let after = load_snapshot(&router).await;
+        assert_eq!(
+            after[&hot], before[&hot],
+            "rebind must not leave a stateful booking on the old hot rank"
+        );
+        assert_eq!(after[&cold], (128, 1));
+
+        let mut guard = router
+            .track_selection(&request, &mut selection)
+            .await
+            .unwrap();
+        let worker_info = tracker.get_worker_info().unwrap();
+        assert_eq!(worker_info.prefill_worker_id, Some(cold.worker_id));
+        assert_eq!(worker_info.prefill_dp_rank, Some(cold.dp_rank));
+
+        assert!(pending_rebind.unwrap().commit());
+        assert_eq!(
+            router
+                .sticky
+                .worker_for_phase(&request, RequestPhase::Prefill),
+            Some(cold)
+        );
+
+        guard.abort().await;
+        router.chooser.free("existing-hot-load").await.unwrap();
+        drop(phase_permit);
+
+        let cleaned = load_snapshot(&router).await;
+        assert_eq!(cleaned[&hot], (0, 0));
+        assert_eq!(cleaned[&cold], (0, 0));
+    }
+
+    #[tokio::test]
+    async fn rebind_cas_does_not_restore_binding_removed_after_decision() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let request_data = session_request("session-race", None, 128);
+        let request = Context::with_id_and_metadata(
+            request_data,
+            "stale-source-request".to_string(),
+            Default::default(),
+        );
+
+        let bind_request = session_request("session-race", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-session-race")
+            .await
+            .unwrap();
+
+        let expected = router
+            .sticky
+            .rebind_token_for_phase(&request, RequestPhase::Prefill)
+            .unwrap();
+        let decision = RebindDecision {
+            session_id: "session-race".to_string(),
+            expected,
+            cold,
+            ttl: Duration::from_secs(300),
+        };
+        let (_, removed) = router
+            .sticky
+            .unbind_for_phase(&request, RequestPhase::Prefill)
+            .unwrap();
+        assert_eq!(removed.unwrap().worker, hot);
+
+        assert!(
+            router
+                .sticky
+                .begin_rebind(
+                    &decision.session_id,
+                    decision.expected,
+                    decision.cold,
+                    decision.ttl,
+                )
+                .is_none()
+        );
+        assert_eq!(
+            router
+                .sticky
+                .worker_for_phase(&request, RequestPhase::Prefill),
+            None,
+            "a removed binding must not be resurrected as cold by a stale decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_prepare_failure_rolls_back_shadow_and_cold_booking() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        router
+            .chooser
+            .add_request(
+                "prepare-fail-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+        let bind_request = session_request("session-prepare-fail", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-session-prepare-fail")
+            .await
+            .unwrap();
+
+        let tracker = Arc::new(RequestTracker::new());
+        let phase_permit = tracker.set_phase(RequestPhase::Prefill).await;
+        let mut request_data = session_request("session-prepare-fail", None, 128);
+        request_data.tracker = Some(tracker);
+        let request = Context::with_id_and_metadata(
+            request_data,
+            "prepare-fail-request".to_string(),
+            Default::default(),
+        );
+
+        let result: Result<((), ManyOut<Annotated<LLMEngineOutput>>), Error> = router
+            .select_and_dispatch_prefill(request, |_, _, _| {
+                Err(anyhow::anyhow!("injected prepare failure").into())
+            })
+            .await;
+        assert!(result.is_err());
+
+        let probe = session_request("session-prepare-fail", None, 1);
+        assert_eq!(
+            router
+                .sticky
+                .worker_for_phase(&probe, RequestPhase::Prefill),
+            Some(hot)
+        );
+        let loads = load_snapshot(&router).await;
+        assert_eq!(loads[&hot], (8192, 1));
+        assert_eq!(loads[&cold], (0, 0));
+
+        router.chooser.free("prepare-fail-hot-load").await.unwrap();
+        drop(phase_permit);
+    }
+
+    #[tokio::test]
+    async fn rebind_dispatch_failure_rolls_back_shadow_and_cold_booking() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        router
+            .chooser
+            .add_request(
+                "dispatch-fail-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+        let bind_request = session_request("session-dispatch-fail", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-session-dispatch-fail")
+            .await
+            .unwrap();
+
+        let tracker = Arc::new(RequestTracker::new());
+        let phase_permit = tracker.set_phase(RequestPhase::Prefill).await;
+        let mut request_data = session_request("session-dispatch-fail", None, 128);
+        request_data.tracker = Some(tracker);
+        let request = Context::with_id_and_metadata(
+            request_data,
+            "dispatch-fail-request".to_string(),
+            Default::default(),
+        );
+
+        let result: Result<((), ManyOut<Annotated<LLMEngineOutput>>), Error> = router
+            .select_and_dispatch_prefill(request, |_, _, _| Ok(()))
+            .await;
+        assert!(result.is_err(), "test router has no dispatchable backend");
+
+        let probe = session_request("session-dispatch-fail", None, 1);
+        assert_eq!(
+            router
+                .sticky
+                .worker_for_phase(&probe, RequestPhase::Prefill),
+            Some(hot)
+        );
+        let loads = load_snapshot(&router).await;
+        assert_eq!(loads[&hot], (8192, 1));
+        assert_eq!(loads[&cold], (0, 0));
+
+        router.chooser.free("dispatch-fail-hot-load").await.unwrap();
+        drop(phase_permit);
     }
 }

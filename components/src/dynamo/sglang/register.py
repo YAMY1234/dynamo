@@ -13,6 +13,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from dynamo._core import Endpoint
+from dynamo.common.backend.disagg import PREFILL_COMPLETE_CAPABILITY_KEY
 from dynamo.common.utils.output_modalities import get_output_modalities
 from dynamo.common.utils.topology import apply_topology_config
 from dynamo.llm import (
@@ -24,7 +25,10 @@ from dynamo.llm import (
     WorkerType,
     register_model,
 )
-from dynamo.sglang._compat import get_scheduler_info
+from dynamo.sglang._compat import (
+    get_scheduler_info,
+    supports_explicit_async_generate_kwarg,
+)
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.args import DynamoConfig, use_modelexpress_remote_instance
 from dynamo.sglang.capacity import (
@@ -35,6 +39,29 @@ from dynamo.sglang.capacity import (
 
 SGLANG_HICACHE_MOONCAKE_RUNTIME_KEY = "sglang_hicache_mooncake"
 SPEC_DECODE_RUNTIME_KEY = "spec_decode"
+
+_NON_LLM_WORKER_FLAGS = (
+    "embedding_worker",
+    "multimodal_encode_worker",
+    "multimodal_worker",
+    "diffusion_worker",
+    "image_diffusion_worker",
+    "video_generation_worker",
+)
+
+
+def _supports_prefill_completion_ack(
+    engine: sgl.Engine, server_args: ServerArgs, dynamo_args: DynamoConfig
+) -> bool:
+    mode = getattr(server_args, "disaggregation_mode", None)
+    mode = getattr(mode, "value", mode)
+    if str(mode).lower() != "prefill" or any(
+        bool(getattr(dynamo_args, flag, False)) for flag in _NON_LLM_WORKER_FLAGS
+    ):
+        return False
+    if not hasattr(engine, "async_generate"):
+        return False
+    return supports_explicit_async_generate_kwarg(engine, "migrate_from")
 
 
 def _register_model_source_path(engine: sgl.Engine, server_args: ServerArgs) -> str:
@@ -326,6 +353,10 @@ async def _get_runtime_config(
     runtime_config.enable_local_indexer = (
         dynamo_args.enable_local_indexer and not is_decode_worker
     )
+    if _supports_prefill_completion_ack(engine, server_args, dynamo_args):
+        runtime_config.set_engine_specific(
+            PREFILL_COMPLETE_CAPABILITY_KEY, json.dumps(True)
+        )
 
     start_dp_rank, end_dp_rank = model_card_dp_rank_bounds(server_args)
     registered_dp_size = end_dp_rank - start_dp_rank

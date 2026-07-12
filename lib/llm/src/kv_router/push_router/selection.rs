@@ -18,7 +18,7 @@ use dynamo_runtime::{
 use crate::{
     kv_router::{
         FindBestMatchOutcome, push_router::KvPushRouter,
-        sticky::coordinator::sticky_allowed_for_phase,
+        sticky::coordinator::sticky_allowed_for_phase, sticky::router::AffinityBindingToken,
     },
     preprocessor::PreprocessedRequest,
     protocols::{
@@ -140,16 +140,32 @@ impl KvPushRouter {
             .and_then(|routing| routing.strict_priority)
             .unwrap_or(0);
         let expected_output_tokens = routing.and_then(|routing| routing.expected_output_tokens);
-        let allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
+        let preserve_sticky_lifecycle = sticky_worker.is_some()
+            && routing
+                .and_then(|routing| routing.session_control.as_ref())
+                .and_then(|session| session.action.as_ref())
+                .is_some();
+        let allowed_worker_ids = if preserve_sticky_lifecycle {
+            None
+        } else {
+            routing.and_then(|routing| routing.allowed_worker_ids.clone())
+        };
         let return_routing_hashes =
             !is_query_only && self.chooser.indexer().records_routing_decisions();
-        let routing_constraints = routing
-            .and_then(|routing| routing.routing_constraints.clone())
-            .unwrap_or_default();
+        let routing_constraints = if preserve_sticky_lifecycle {
+            RoutingConstraints::default()
+        } else {
+            routing
+                .and_then(|routing| routing.routing_constraints.clone())
+                .unwrap_or_default()
+        };
         let sticky_pin = sticky_worker.map(|worker| (worker.worker_id, Some(worker.dp_rank)));
-        let Some((pinned_worker_id, requested_dp_rank)) =
+        let requested_pin = if preserve_sticky_lifecycle {
+            sticky_pin
+        } else {
             pinned_worker_hint(phase, routing).or(sticky_pin)
-        else {
+        };
+        let Some((pinned_worker_id, requested_dp_rank)) = requested_pin else {
             let _nvtx_kv = dynamo_nvtx_range!("route.kv_match");
             let selection = self
                 .select_best_match(BestMatchArgs {
@@ -239,7 +255,7 @@ impl KvPushRouter {
         .await
     }
 
-    fn sticky_worker_ineligibility_for_phase(
+    pub(super) fn worker_ineligibility_for_phase(
         &self,
         request: &PreprocessedRequest,
         phase: RequestPhase,
@@ -265,21 +281,27 @@ impl KvPushRouter {
         eligibility.validate_worker_rank(&configs, worker).err()
     }
 
-    pub(crate) fn unbind_ineligible_sticky_worker_for_phase(
+    pub(super) fn remove_ineligible_sticky_binding_for_phase(
         &self,
         context_id: &str,
         request: &PreprocessedRequest,
         phase: RequestPhase,
-        worker: WorkerWithDpRank,
+        token: AffinityBindingToken,
     ) -> bool {
-        let Some(reason) = self.sticky_worker_ineligibility_for_phase(request, phase, worker)
-        else {
+        let worker = token.binding.worker;
+        let Some(reason) = self.worker_ineligibility_for_phase(request, phase, worker) else {
             return false;
         };
 
-        let Some((session_id, _binding)) = self.sticky.unbind_for_phase(request, phase) else {
+        if !self.sticky.unbind_if_token_for_phase(request, phase, token) {
             return false;
-        };
+        }
+        let session_id = request
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.session_control.as_ref())
+            .map(|session| session.session_id.as_str())
+            .unwrap_or("<unknown>");
         tracing::warn!(
             request_id = %context_id,
             %session_id,
@@ -289,6 +311,41 @@ impl KvPushRouter {
             "Sticky worker is no longer eligible; removing session affinity"
         );
         true
+    }
+
+    /// Resolve sticky affinity while making an ineligibility cleanup a
+    /// compare-and-remove operation. A concurrent committed binding wins; on
+    /// contention we reread instead of deleting or routing from stale state.
+    pub(super) fn resolve_sticky_binding_for_phase(
+        &self,
+        context_id: &str,
+        request: &PreprocessedRequest,
+        phase: RequestPhase,
+        preserve_lifecycle_owner: bool,
+    ) -> Result<Option<AffinityBindingToken>, Error> {
+        const MAX_AFFINITY_REREADS: usize = 4;
+
+        for _ in 0..MAX_AFFINITY_REREADS {
+            let Some(token) = self.sticky.binding_token_for_phase(request, phase) else {
+                return Ok(None);
+            };
+            if preserve_lifecycle_owner
+                || self
+                    .worker_ineligibility_for_phase(request, phase, token.binding.worker)
+                    .is_none()
+            {
+                return Ok(Some(token));
+            }
+            if self.remove_ineligible_sticky_binding_for_phase(context_id, request, phase, token) {
+                return Ok(None);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "session affinity changed repeatedly while validating request {context_id}; \
+             refusing to route from stale binding state"
+        )
+        .into())
     }
 }
 

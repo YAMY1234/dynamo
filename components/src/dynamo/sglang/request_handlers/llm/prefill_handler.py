@@ -8,6 +8,15 @@ from typing import Any, AsyncGenerator, Dict, Optional
 import sglang as sgl
 
 from dynamo._core import Context
+from dynamo.common.backend.disagg import (
+    PREFILL_TERMINAL_FAILURE,
+    PREFILL_TERMINAL_PENDING,
+    PREFILL_TERMINAL_SUCCESS,
+    PREFILL_TERMINAL_UNKNOWN,
+    classify_prefill_terminal,
+    prefill_complete_marker,
+    run_prefill_before_ack_test_hook,
+)
 from dynamo.health_check import HEALTH_CHECK_KEY
 from dynamo.sglang.args import Config
 from dynamo.sglang.publisher import DynamoSglangPublisher
@@ -187,18 +196,38 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
         # Yield bootstrap_info for PrefillRouter - required for async generator
         # contract and Rust-side expects disaggregated_params in first output.
-        yield {
-            "token_ids": [],
-            "text": None,
-            "finish_reason": None,
-            "disaggregated_params": bootstrap_info,
-        }
+        try:
+            yield {
+                "token_ids": [],
+                "text": None,
+                "finish_reason": None,
+                "disaggregated_params": bootstrap_info,
+            }
+        except (GeneratorExit, asyncio.CancelledError):
+            # No consume task exists yet, so this generator owns best-effort
+            # cleanup whether the SGLang inner stream is eager or lazy.
+            self._abort_sglang_request(context.trace_id)
+            await self._close_prefill_stream(results, context.trace_id)
+            raise
 
         task = asyncio.create_task(self._consume_results(results, context))
         self._consume_tasks.add(task)
         task.add_done_callback(self._consume_tasks.discard)
 
         await task
+
+        # The cancellation monitor can make the SGLang generator close
+        # cleanly after abort. That EOF is not successful prefill completion.
+        if context.is_stopped():
+            self._abort_sglang_request(context.trace_id)
+            raise asyncio.CancelledError("prefill stopped before completion ACK")
+
+        await run_prefill_before_ack_test_hook(inner_request, context.id())
+
+        # The first yielded chunk only confirms bootstrap-room registration.
+        # Emit the shared internal ACK after the engine stream drains so the
+        # router can safely publish a shadow cold affinity.
+        yield prefill_complete_marker()
 
     async def _consume_results(
         self, results: AsyncGenerator[Any, None], context: Context
@@ -211,16 +240,76 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         """
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
-        async with self._cancellation_monitor(request_id_future, context):
-            async for res in results:
-                # Extract SGLang request ID from the first response and set the future
-                if not request_id_future.done():
-                    meta_info = res.get("meta_info", {})
-                    sglang_request_id = meta_info.get("id")
-                    if sglang_request_id:
-                        request_id_future.set_result(sglang_request_id)
-                        logging.debug(f"New Prefill Request ID: {sglang_request_id}")
+        saw_result = False
+        final_state = PREFILL_TERMINAL_PENDING
+        try:
+            async with self._cancellation_monitor(request_id_future, context):
+                async for res in results:
+                    # Extract SGLang request ID from the first response and set the future
+                    if not request_id_future.done():
+                        meta_info = res.get("meta_info", {})
+                        sglang_request_id = meta_info.get("id")
+                        if sglang_request_id:
+                            request_id_future.set_result(sglang_request_id)
+                            logging.debug(
+                                f"New Prefill Request ID: {sglang_request_id}"
+                            )
 
-                # Note: No explicit cancellation checks needed here.
-                # When abort_request is called by the cancellation monitor,
-                # SGLang will terminate this async generator automatically.
+                    saw_result = True
+                    final_state = classify_prefill_terminal(res)
+                    if final_state == PREFILL_TERMINAL_FAILURE:
+                        raise RuntimeError(
+                            "SGLang prefill stream ended with abort/error"
+                        )
+                    if final_state == PREFILL_TERMINAL_UNKNOWN:
+                        raise RuntimeError(
+                            "SGLang prefill stream returned an unknown finish reason"
+                        )
+
+            if context.is_stopped():
+                raise asyncio.CancelledError("prefill stopped before completion ACK")
+            if not saw_result:
+                raise RuntimeError("SGLang prefill stream returned no results")
+            if final_state != PREFILL_TERMINAL_SUCCESS:
+                raise RuntimeError(
+                    "SGLang prefill stream ended without a successful terminal"
+                )
+        except asyncio.CancelledError:
+            self._abort_sglang_request(context.trace_id)
+            await self._close_prefill_stream(results, context.trace_id)
+            raise
+        except Exception:
+            self._abort_sglang_request(context.trace_id)
+            await self._close_prefill_stream(results, context.trace_id)
+            raise
+
+    async def _close_prefill_stream(
+        self, stream: AsyncGenerator[Any, None], rid: Optional[str]
+    ) -> None:
+        close = getattr(stream, "aclose", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except (Exception, asyncio.CancelledError):
+            logging.debug(
+                "Failed to close prefill stream (rid=%s)",
+                rid,
+                exc_info=True,
+            )
+
+    def _abort_sglang_request(self, rid: Optional[str]) -> None:
+        """Best-effort release of a registered prefill bootstrap room."""
+        if rid is None:
+            return
+        tokenizer_manager = getattr(self.engine, "tokenizer_manager", None)
+        if tokenizer_manager is None:
+            return
+        try:
+            tokenizer_manager.abort_request(rid=rid, abort_all=False)
+        except Exception:
+            logging.debug(
+                "abort_request failed while releasing bootstrap room (rid=%s)",
+                rid,
+                exc_info=True,
+            )

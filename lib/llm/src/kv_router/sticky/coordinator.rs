@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use dashmap::DashMap;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_runtime::component::Component;
+use dynamo_runtime::error::{DynamoError, ErrorType};
 
 use crate::{
     preprocessor::PreprocessedRequest,
@@ -20,8 +22,8 @@ use crate::{
 use super::{
     lifecycle::{SessionCloseAction, SessionLifecycleController},
     router::{
-        AffinityBinding, AffinityBindingToken, AffinityKind, InMemoryAffinityStore,
-        StickySessionRouter,
+        AffinityBinding, AffinityBindingToken, AffinityKind, AffinityRebindToken,
+        InMemoryAffinityStore, StickySessionRouter,
     },
 };
 
@@ -36,9 +38,57 @@ pub struct SessionRoutingRollback {
     close_opened_session: Option<SessionCloseAction>,
 }
 
+/// Owns a shadow rebind until the backend confirms cold prefill completion.
+/// Dropping it conditionally rolls the transition back.
+pub(crate) struct SessionRebindGuard {
+    router: Arc<StickySessionRouter>,
+    session_id: String,
+    token: Option<AffinityRebindToken>,
+}
+
+/// Serializes prefill turns for one sticky session on this frontend.
+///
+/// A rebind snapshots the hot prefix and may publish a cold owner when prefill
+/// completes. Allowing another turn to mutate the hot owner in that window can
+/// make the cold snapshot stale even when the affinity revision itself did not
+/// change. The first implementation therefore fails concurrent turns closed;
+/// a shared/queued implementation can replace this local guard later.
+pub(crate) struct SessionTurnGuard {
+    turns: Arc<DashMap<String, String>>,
+    session_id: String,
+    owner: String,
+}
+
+impl Drop for SessionTurnGuard {
+    fn drop(&mut self) {
+        self.turns
+            .remove_if(&self.session_id, |_, owner| owner == &self.owner);
+    }
+}
+
+impl SessionRebindGuard {
+    pub(crate) fn commit(mut self) -> bool {
+        let token = self.token.expect("pending rebind token must be present");
+        if !self.router.commit_rebind(&self.session_id, token) {
+            return false;
+        }
+        self.token = None;
+        true
+    }
+}
+
+impl Drop for SessionRebindGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.router.rollback_rebind(&self.session_id, token);
+        }
+    }
+}
+
 pub struct StickySessionCoordinator {
     router: Arc<StickySessionRouter>,
     lifecycle: Arc<SessionLifecycleController>,
+    prefill_turns: Arc<DashMap<String, String>>,
 }
 
 impl StickySessionCoordinator {
@@ -56,7 +106,54 @@ impl StickySessionCoordinator {
             InMemoryAffinityStore::new_with_on_expire(Some(on_expire)),
         ));
 
-        StickySessionCoordinator { router, lifecycle }
+        StickySessionCoordinator {
+            router,
+            lifecycle,
+            prefill_turns: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Acquire exclusive ownership of a sticky session turn for `phase`.
+    /// Requests without session control do not need a guard.
+    pub(crate) fn acquire_turn_for_phase(
+        &self,
+        request: &PreprocessedRequest,
+        phase: RequestPhase,
+        owner: &str,
+    ) -> Result<Option<SessionTurnGuard>> {
+        use dashmap::mapref::entry::Entry;
+
+        let Some(session_id) = turn_session_id_for_phase(request, phase) else {
+            return Ok(None);
+        };
+        let session_id = session_id.to_owned();
+        match self.prefill_turns.entry(session_id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(owner.to_owned());
+                Ok(Some(SessionTurnGuard {
+                    turns: self.prefill_turns.clone(),
+                    session_id,
+                    owner: owner.to_owned(),
+                }))
+            }
+            Entry::Occupied(entry) => {
+                let current_owner = entry.get().to_owned();
+                tracing::warn!(
+                    %session_id,
+                    phase = %phase,
+                    request_id = %owner,
+                    %current_owner,
+                    "Rejected concurrent sticky session turn"
+                );
+                Err(DynamoError::builder()
+                    .error_type(ErrorType::InvalidArgument)
+                    .message(format!(
+                        "sticky session {session_id} already has an in-flight {phase} turn owned by {current_owner}"
+                    ))
+                    .build()
+                    .into())
+            }
+        }
     }
 
     pub fn worker_for_phase(
@@ -64,8 +161,20 @@ impl StickySessionCoordinator {
         request: &PreprocessedRequest,
         phase: RequestPhase,
     ) -> Option<WorkerWithDpRank> {
-        let session_id = sticky_session_id_for_phase(request, phase)?;
+        let session_id = binding_session_id_for_phase(request, phase)?;
         self.router.peek_session(session_id)
+    }
+
+    /// Return the visible binding and revision in one store read. Lifecycle
+    /// actions intentionally resolve an existing owner even when the request
+    /// carries new constraints or explicit pins.
+    pub(crate) fn binding_token_for_phase(
+        &self,
+        request: &PreprocessedRequest,
+        phase: RequestPhase,
+    ) -> Option<AffinityBindingToken> {
+        let session_id = binding_session_id_for_phase(request, phase)?;
+        self.router.peek_binding_token(session_id)
     }
 
     /// Phase-gated sticky session id for this request, or `None` when sticky
@@ -80,20 +189,32 @@ impl StickySessionCoordinator {
         sticky_session_id_for_phase(request, phase)
     }
 
-    /// Layer-2 rebind: move `session_id` to a colder `(worker, dp_rank)`,
-    /// returning the OLD (hot) target for the `migrate_from` directive.
-    /// `RouterOnly` so no lifecycle open/close RPC fires (the migrate pull is
-    /// data-plane). See [`StickySessionRouter::rebind`].
-    pub(crate) fn rebind(
+    /// Return a stable revision for a Layer-2 rebind decision. A pending
+    /// transition is deliberately not eligible for another rebind.
+    pub(crate) fn rebind_token_for_phase(
+        &self,
+        request: &PreprocessedRequest,
+        phase: RequestPhase,
+    ) -> Option<AffinityBindingToken> {
+        let session_id = sticky_session_id_for_phase(request, phase)?;
+        self.router.peek_rebind_token(session_id)
+    }
+
+    /// Atomically prepare a shadow rebind. The old binding remains visible
+    /// until the returned guard is committed after cold prefill completion.
+    pub(crate) fn begin_rebind(
         &self,
         session_id: &str,
+        expected: AffinityBindingToken,
         cold: WorkerWithDpRank,
         ttl: Duration,
-    ) -> Option<WorkerWithDpRank> {
-        let (old, _token) =
-            self.router
-                .rebind(session_id, cold, ttl, AffinityKind::RouterOnly);
-        old
+    ) -> Option<SessionRebindGuard> {
+        let token = self.router.begin_rebind(session_id, expected, cold, ttl)?;
+        Some(SessionRebindGuard {
+            router: self.router.clone(),
+            session_id: session_id.to_owned(),
+            token: Some(token),
+        })
     }
 
     /// True if `session_id` was rebound within `cooldown`; used to throttle
@@ -127,6 +248,18 @@ impl StickySessionCoordinator {
     ) -> Option<(&'a str, Option<AffinityBinding>)> {
         let session_id = sticky_session_id_for_phase(request, phase)?;
         Some((session_id, self.router.unbind(session_id)))
+    }
+
+    pub(crate) fn unbind_if_token_for_phase(
+        &self,
+        request: &PreprocessedRequest,
+        phase: RequestPhase,
+        token: AffinityBindingToken,
+    ) -> bool {
+        let Some(session_id) = binding_session_id_for_phase(request, phase) else {
+            return false;
+        };
+        self.router.unbind_if_token(session_id, token)
     }
 
     pub async fn on_routed(
@@ -200,14 +333,16 @@ impl StickySessionCoordinator {
                 })
             }
             SessionAction::Close => {
-                let should_close_worker_session = self
-                    .router
-                    .unbind(&sc.session_id)
+                let removed = self.router.unbind(&sc.session_id);
+                let should_close_worker_session = removed
                     .map(|binding| binding.kind == AffinityKind::EngineBacked)
                     .unwrap_or(true);
+                let close_worker_id = removed
+                    .map(|binding| binding.worker.worker_id)
+                    .unwrap_or(worker.worker_id);
                 let deferred_close = if should_close_worker_session {
                     self.lifecycle
-                        .deferred_close(sc.session_id.clone(), worker.worker_id)
+                        .deferred_close(sc.session_id.clone(), close_worker_id)
                         .await
                 } else {
                     None
@@ -269,11 +404,41 @@ fn sticky_session_id_for_phase(request: &PreprocessedRequest, phase: RequestPhas
         .map(|sc| sc.session_id.as_str())
 }
 
+fn turn_session_id_for_phase(request: &PreprocessedRequest, _phase: RequestPhase) -> Option<&str> {
+    // Explicit pins disable sticky target selection, but the request still
+    // mutates the same engine session and must remain serialized with it.
+    request
+        .routing
+        .as_ref()?
+        .session_control
+        .as_ref()
+        .map(|sc| sc.session_id.as_str())
+}
+
+fn binding_session_id_for_phase(
+    request: &PreprocessedRequest,
+    phase: RequestPhase,
+) -> Option<&str> {
+    let routing = request.routing.as_ref()?;
+    let session_control = routing.session_control.as_ref()?;
+    // An existing lifecycle action belongs to the worker that owns the
+    // session. Close must not be redirected before the old engine session is
+    // freed, even if this request carries new routing constraints.
+    if session_control.action.is_some() {
+        Some(session_control.session_id.as_str())
+    } else {
+        sticky_session_id_for_phase(request, phase)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sticky_allowed_for_phase;
+    use super::{sticky_allowed_for_phase, turn_session_id_for_phase};
     use crate::protocols::common::extensions::SessionControl;
-    use crate::protocols::common::{preprocessor::RoutingHints, timing::RequestPhase};
+    use crate::protocols::common::{
+        preprocessor::{PreprocessedRequest, RoutingHints},
+        timing::RequestPhase,
+    };
 
     fn session_control() -> SessionControl {
         SessionControl {
@@ -363,5 +528,38 @@ mod tests {
             RequestPhase::Aggregated,
             Some(&aggregated)
         ));
+    }
+
+    #[test]
+    fn turn_serialization_keeps_session_id_with_explicit_pins() {
+        let prefill = RoutingHints {
+            session_control: Some(session_control()),
+            prefill_worker_id: Some(1),
+            prefill_dp_rank: Some(2),
+            ..Default::default()
+        };
+        let backend = RoutingHints {
+            session_control: Some(session_control()),
+            backend_instance_id: Some(5),
+            dp_rank: Some(3),
+            ..Default::default()
+        };
+
+        for (phase, routing) in [
+            (RequestPhase::Prefill, prefill),
+            (RequestPhase::Prefill, backend.clone()),
+            (RequestPhase::Aggregated, backend),
+        ] {
+            let request = PreprocessedRequest::builder()
+                .model("test-model".to_string())
+                .token_ids(vec![1])
+                .stop_conditions(Default::default())
+                .sampling_options(Default::default())
+                .output_options(Default::default())
+                .routing(Some(routing))
+                .build()
+                .unwrap();
+            assert_eq!(turn_session_id_for_phase(&request, phase), Some("sess-1"));
+        }
     }
 }

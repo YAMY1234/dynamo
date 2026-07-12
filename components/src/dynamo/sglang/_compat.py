@@ -108,6 +108,24 @@ def filter_supported_async_generate_kwargs(
     return {key: value for key, value in kwargs.items() if key in supported_kwarg_names}
 
 
+def supports_explicit_async_generate_kwarg(engine: Any, name: str) -> bool:
+    """Return whether ``async_generate`` explicitly declares ``name``.
+
+    Capability publication must fail closed: a variadic compatibility wrapper
+    may accept a keyword without forwarding it to ``GenerateReqInput``.
+    """
+    async_generate = engine.async_generate
+    signature_source = getattr(async_generate, "__func__", async_generate)
+    try:
+        parameter = inspect.signature(signature_source).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
 def get_scheduler_info(engine: Any) -> dict:
     """Return the scheduler-info dict for rank-0 of an ``sgl.Engine``.
 
@@ -155,4 +173,5 @@ __all__ = [
     "ensure_sglang_top_level_exports",
     "filter_supported_async_generate_kwargs",
     "get_scheduler_info",
+    "supports_explicit_async_generate_kwarg",
 ]

@@ -45,6 +45,17 @@ pub struct AffinityBindingToken {
     pub revision: u64,
 }
 
+/// Token for a pending compare-and-rebind transition.
+///
+/// The old binding remains visible until this token is committed. Both commit
+/// and rollback compare the old and pending revisions, so a concurrent
+/// bind/remove always wins without being overwritten by the transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffinityRebindToken {
+    pub previous: AffinityBindingToken,
+    pub pending: AffinityBindingToken,
+}
+
 /// Trait for session affinity storage backends.
 ///
 /// Stores `(worker, dp_rank)` as an atomic routing target. `get` is the
@@ -57,6 +68,18 @@ pub trait AffinityStore: Send + Sync {
 
     /// Look up the `(worker, dp_rank)` for a session without refreshing TTL.
     fn peek(&self, session_id: &str) -> Option<WorkerWithDpRank>;
+
+    /// Return the current binding revision without refreshing TTL. Unlike a
+    /// rebind candidate lookup, this remains available while a shadow exists.
+    /// This is required because conditional affinity cleanup is part of core
+    /// sticky routing; an implementation must not silently degrade to a miss.
+    fn peek_binding_token(&self, session_id: &str) -> Option<AffinityBindingToken>;
+
+    /// Return the current binding token only when no rebind is already pending.
+    /// The default disables rebind for stores without atomic transition support.
+    fn peek_rebind_token(&self, _session_id: &str) -> Option<AffinityBindingToken> {
+        None
+    }
 
     /// Bind a session to a `(worker, dp_rank)` with the given TTL and kind.
     fn put(
@@ -72,6 +95,32 @@ pub trait AffinityStore: Send + Sync {
 
     /// Remove a binding only if it is still the binding created by this attempt.
     fn remove_if_token(&self, session_id: &str, token: AffinityBindingToken) -> bool;
+
+    /// Atomically start a shadow rebind if `expected` is still current.
+    fn begin_rebind(
+        &self,
+        _session_id: &str,
+        _expected: AffinityBindingToken,
+        _cold: WorkerWithDpRank,
+        _ttl: Duration,
+    ) -> Option<AffinityRebindToken> {
+        None
+    }
+
+    /// Publish the pending cold binding if the transition is still current.
+    fn commit_rebind(&self, _session_id: &str, _token: AffinityRebindToken) -> bool {
+        false
+    }
+
+    /// Remove the pending cold binding if the transition is still current.
+    fn rollback_rebind(&self, _session_id: &str, _token: AffinityRebindToken) -> bool {
+        false
+    }
+}
+
+struct PendingAffinityBinding {
+    token: AffinityBindingToken,
+    ttl: Duration,
 }
 
 /// In-memory affinity entry with sliding-window TTL.
@@ -81,6 +130,7 @@ struct AffinityEntry {
     expires_at: Instant,
     kind: AffinityKind,
     revision: u64,
+    pending_rebind: Option<PendingAffinityBinding>,
 }
 
 impl AffinityEntry {
@@ -88,6 +138,13 @@ impl AffinityEntry {
         AffinityBinding {
             worker: self.worker,
             kind: self.kind,
+        }
+    }
+
+    fn token(&self) -> AffinityBindingToken {
+        AffinityBindingToken {
+            binding: self.binding(),
+            revision: self.revision,
         }
     }
 }
@@ -145,7 +202,12 @@ impl InMemoryAffinityStore {
         });
     }
 
-    fn lookup(&self, session_id: &str, refresh: bool) -> Option<WorkerWithDpRank> {
+    fn lookup_token(
+        &self,
+        session_id: &str,
+        refresh: bool,
+        require_no_pending_rebind: bool,
+    ) -> Option<AffinityBindingToken> {
         let now = Instant::now();
         let mut entry = self.map.get_mut(session_id)?;
         if entry.expires_at <= now {
@@ -156,18 +218,22 @@ impl InMemoryAffinityStore {
             return None;
         }
 
-        let worker = entry.worker;
+        if require_no_pending_rebind && entry.pending_rebind.is_some() {
+            return None;
+        }
+
+        let token = entry.token();
         if refresh {
             entry.expires_at = now + entry.ttl;
         }
         tracing::info!(
             %session_id,
-            worker_id = worker.worker_id,
-            dp_rank = worker.dp_rank,
+            worker_id = token.binding.worker.worker_id,
+            dp_rank = token.binding.worker.dp_rank,
             refreshed = refresh,
             "Sticky session hit"
         );
-        Some(worker)
+        Some(token)
     }
 
     fn remove_expired_if_current(
@@ -196,11 +262,21 @@ impl InMemoryAffinityStore {
 
 impl AffinityStore for InMemoryAffinityStore {
     fn get(&self, session_id: &str) -> Option<WorkerWithDpRank> {
-        self.lookup(session_id, true)
+        self.lookup_token(session_id, true, false)
+            .map(|token| token.binding.worker)
     }
 
     fn peek(&self, session_id: &str) -> Option<WorkerWithDpRank> {
-        self.lookup(session_id, false)
+        self.lookup_token(session_id, false, false)
+            .map(|token| token.binding.worker)
+    }
+
+    fn peek_binding_token(&self, session_id: &str) -> Option<AffinityBindingToken> {
+        self.lookup_token(session_id, false, false)
+    }
+
+    fn peek_rebind_token(&self, session_id: &str) -> Option<AffinityBindingToken> {
+        self.lookup_token(session_id, false, true)
     }
 
     fn put(
@@ -220,6 +296,7 @@ impl AffinityStore for InMemoryAffinityStore {
                 expires_at: Instant::now() + ttl,
                 kind,
                 revision,
+                pending_rebind: None,
             },
         );
         AffinityBindingToken { binding, revision }
@@ -237,6 +314,77 @@ impl AffinityStore for InMemoryAffinityStore {
                 entry.revision == token.revision && entry.binding() == token.binding
             })
             .is_some()
+    }
+
+    fn begin_rebind(
+        &self,
+        session_id: &str,
+        expected: AffinityBindingToken,
+        cold: WorkerWithDpRank,
+        ttl: Duration,
+    ) -> Option<AffinityRebindToken> {
+        let now = Instant::now();
+        let mut entry = self.map.get_mut(session_id)?;
+        if entry.expires_at <= now || entry.token() != expected || entry.pending_rebind.is_some() {
+            return None;
+        }
+
+        let pending = AffinityBindingToken {
+            binding: AffinityBinding {
+                worker: cold,
+                kind: expected.binding.kind,
+            },
+            revision: NEXT_AFFINITY_REVISION.fetch_add(1, Ordering::Relaxed),
+        };
+        entry.pending_rebind = Some(PendingAffinityBinding {
+            token: pending,
+            ttl,
+        });
+        Some(AffinityRebindToken {
+            previous: expected,
+            pending,
+        })
+    }
+
+    fn commit_rebind(&self, session_id: &str, token: AffinityRebindToken) -> bool {
+        let now = Instant::now();
+        let Some(mut entry) = self.map.get_mut(session_id) else {
+            return false;
+        };
+        if entry.expires_at <= now || entry.token() != token.previous {
+            return false;
+        }
+        let Some(pending) = entry.pending_rebind.as_ref() else {
+            return false;
+        };
+        if pending.token != token.pending {
+            return false;
+        }
+
+        let pending = entry
+            .pending_rebind
+            .take()
+            .expect("pending rebind checked above");
+        entry.worker = pending.token.binding.worker;
+        entry.kind = pending.token.binding.kind;
+        entry.revision = pending.token.revision;
+        entry.ttl = pending.ttl;
+        entry.expires_at = now + pending.ttl;
+        true
+    }
+
+    fn rollback_rebind(&self, session_id: &str, token: AffinityRebindToken) -> bool {
+        let Some(mut entry) = self.map.get_mut(session_id) else {
+            return false;
+        };
+        if entry.token() != token.previous
+            || entry.pending_rebind.as_ref().map(|pending| pending.token) != Some(token.pending)
+        {
+            return false;
+        }
+
+        entry.pending_rebind = None;
+        true
     }
 }
 
@@ -274,6 +422,18 @@ impl StickySessionRouter {
         self.store.peek(session_id)
     }
 
+    /// Return the visible binding and its revision, including while a shadow
+    /// transition is pending.
+    pub(crate) fn peek_binding_token(&self, session_id: &str) -> Option<AffinityBindingToken> {
+        self.store.peek_binding_token(session_id)
+    }
+
+    /// Return a revision token suitable for an atomic rebind decision.
+    /// A session with another rebind already in flight is not a candidate.
+    pub(crate) fn peek_rebind_token(&self, session_id: &str) -> Option<AffinityBindingToken> {
+        self.store.peek_rebind_token(session_id)
+    }
+
     /// Bind a session to a `(worker, dp_rank)` with the given TTL and kind.
     pub fn bind(
         &self,
@@ -293,36 +453,64 @@ impl StickySessionRouter {
         self.store.put(session_id, worker, ttl, kind)
     }
 
-    /// Rebind a session to a colder `(worker, dp_rank)`, returning the OLD
-    /// (hot) target so the caller can build a `migrate_from` directive.
-    /// Last-write-wins over [`Self::bind`] (same `store.put` primitive);
-    /// preserves the caller-chosen `kind`/`ttl`. Stamps `last_rebind` so
-    /// [`Self::in_rebind_cooldown`] can throttle subsequent rebinds.
-    ///
-    /// NOTE: peek-then-put is not atomic across the two calls; this is
-    /// acceptable for the single in-memory router (see module doc) where the
-    /// rebind decision is itself serialized on the routing path.
-    pub fn rebind(
+    /// Start a shadow rebind without changing the target returned by resolve.
+    /// The expected revision makes this a compare-and-set operation.
+    pub(crate) fn begin_rebind(
         &self,
         session_id: &str,
+        expected: AffinityBindingToken,
         cold: WorkerWithDpRank,
         ttl: Duration,
-        kind: AffinityKind,
-    ) -> (Option<WorkerWithDpRank>, AffinityBindingToken) {
-        let old = self.store.peek(session_id);
-        let token = self.store.put(session_id, cold, ttl, kind);
+    ) -> Option<AffinityRebindToken> {
+        if expected.binding.kind == AffinityKind::EngineBacked
+            && expected.binding.worker.worker_id != cold.worker_id
+        {
+            tracing::warn!(
+                %session_id,
+                hot_worker_id = expected.binding.worker.worker_id,
+                hot_dp_rank = expected.binding.worker.dp_rank,
+                cold_worker_id = cold.worker_id,
+                cold_dp_rank = cold.dp_rank,
+                "Refusing cross-worker rebind for engine-backed session"
+            );
+            return None;
+        }
+
+        let token = self.store.begin_rebind(session_id, expected, cold, ttl)?;
+        tracing::info!(
+            %session_id,
+            old_worker_id = expected.binding.worker.worker_id,
+            old_dp_rank = expected.binding.worker.dp_rank,
+            new_worker_id = cold.worker_id,
+            new_dp_rank = cold.dp_rank,
+            kind = ?expected.binding.kind,
+            "Sticky rebind prepared as shadow transition"
+        );
+        Some(token)
+    }
+
+    /// Atomically publish a previously prepared shadow rebind.
+    pub(crate) fn commit_rebind(&self, session_id: &str, token: AffinityRebindToken) -> bool {
+        if !self.store.commit_rebind(session_id, token) {
+            return false;
+        }
         self.last_rebind
             .insert(session_id.to_owned(), Instant::now());
         tracing::info!(
             %session_id,
-            old_worker_id = old.map(|w| w.worker_id),
-            old_dp_rank = old.map(|w| w.dp_rank),
-            new_worker_id = cold.worker_id,
-            new_dp_rank = cold.dp_rank,
-            kind = ?kind,
-            "Sticky rebind: moving session to colder dp_rank"
+            old_worker_id = token.previous.binding.worker.worker_id,
+            old_dp_rank = token.previous.binding.worker.dp_rank,
+            new_worker_id = token.pending.binding.worker.worker_id,
+            new_dp_rank = token.pending.binding.worker.dp_rank,
+            kind = ?token.pending.binding.kind,
+            "Sticky rebind committed"
         );
-        (old, token)
+        true
+    }
+
+    /// Discard a shadow rebind without disturbing a concurrent newer binding.
+    pub(crate) fn rollback_rebind(&self, session_id: &str, token: AffinityRebindToken) -> bool {
+        self.store.rollback_rebind(session_id, token)
     }
 
     /// Returns true if this session was rebound less than `cooldown` ago.
@@ -395,6 +583,7 @@ mod tests {
                 expires_at,
                 kind: AffinityKind::EngineBacked,
                 revision: 1,
+                pending_rebind: None,
             },
         );
         let store = InMemoryAffinityStore {
@@ -440,41 +629,38 @@ mod tests {
     }
 
     #[test]
-    fn rebind_same_worker_different_dp_rank_is_not_dropped() {
-        // The exact case G3 feared: rebinding within the SAME worker to a
-        // different dp_rank must overwrite the binding, not be silently
-        // dropped. Returns the OLD target for migrate_from.
+    fn shadow_rebind_stays_hot_until_atomic_commit() {
         let map = Arc::new(DashMap::new());
         let store = InMemoryAffinityStore {
             map: map.clone(),
             on_expire: None,
         };
         let router = StickySessionRouter::new(store);
-        router.bind(
+        let expected = router.bind(
             "sess-1",
             worker(42, 3),
             Duration::from_secs(300),
-            AffinityKind::RouterOnly,
+            AffinityKind::EngineBacked,
         );
 
-        let (old, _token) = router.rebind(
-            "sess-1",
-            worker(42, 7),
-            Duration::from_secs(300),
-            AffinityKind::RouterOnly,
-        );
+        let transition = router
+            .begin_rebind("sess-1", expected, worker(42, 7), Duration::from_secs(300))
+            .unwrap();
 
-        assert_eq!(old, Some(worker(42, 3)));
+        assert_eq!(router.peek_session("sess-1"), Some(worker(42, 3)));
+        assert!(router.peek_rebind_token("sess-1").is_none());
+        assert!(router.commit_rebind("sess-1", transition));
         assert_eq!(router.peek_session("sess-1"), Some(worker(42, 7)));
-        assert_eq!(map.get("sess-1").unwrap().worker, worker(42, 7));
+        let entry = map.get("sess-1").unwrap();
+        assert_eq!(entry.worker, worker(42, 7));
+        assert_eq!(entry.kind, AffinityKind::EngineBacked);
+        assert!(entry.pending_rebind.is_none());
+        assert!(router.in_rebind_cooldown("sess-1", Duration::from_secs(5)));
     }
 
-    /// F1: the Layer-2 rebind trigger gates on an existing binding via
-    /// `worker_for_phase` -> `peek_session(...).is_some()`. This encodes the
-    /// HIT-vs-MISS semantics the gate relies on: a fresh session (no prior
-    /// bind) is a MISS and must NOT trigger a rebind; an already-bound session
-    /// is a HIT and IS eligible. Mirrors the `self.sticky.worker_for_phase(..)?`
-    /// short-circuit in `check_and_trigger_rebind` (push_router.rs).
+    /// The Layer-2 rebind trigger gates on a stable existing binding token.
+    /// A fresh session is a MISS and must not trigger a rebind; an already-bound
+    /// session is a HIT and is eligible when no transition is pending.
     #[test]
     fn rebind_gate_fires_on_existing_binding_not_on_fresh_session() {
         let store = InMemoryAffinityStore {
@@ -513,24 +699,132 @@ mod tests {
     }
 
     #[test]
-    fn rebind_records_cooldown() {
+    fn stale_rebind_revision_does_not_overwrite_newer_binding() {
         let store = InMemoryAffinityStore {
             map: Arc::new(DashMap::new()),
             on_expire: None,
         };
         let router = StickySessionRouter::new(store);
-        assert!(!router.in_rebind_cooldown("sess-1", Duration::from_secs(5)));
-
-        router.rebind(
+        let stale = router.bind(
             "sess-1",
             worker(1, 0),
             Duration::from_secs(300),
             AffinityKind::RouterOnly,
         );
+        router.bind(
+            "sess-1",
+            worker(2, 0),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
 
-        assert!(router.in_rebind_cooldown("sess-1", Duration::from_secs(5)));
-        // A zero cooldown never gates.
-        assert!(!router.in_rebind_cooldown("sess-1", Duration::from_secs(0)));
+        assert!(
+            router
+                .begin_rebind("sess-1", stale, worker(3, 0), Duration::from_secs(300),)
+                .is_none()
+        );
+        assert_eq!(router.peek_session("sess-1"), Some(worker(2, 0)));
+    }
+
+    #[test]
+    fn shadow_rebind_rollback_preserves_hot_and_not_newer_binding() {
+        let store = InMemoryAffinityStore {
+            map: Arc::new(DashMap::new()),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+        let expected = router.bind(
+            "sess-1",
+            worker(1, 0),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        let transition = router
+            .begin_rebind("sess-1", expected, worker(1, 1), Duration::from_secs(300))
+            .unwrap();
+
+        assert!(router.rollback_rebind("sess-1", transition));
+        assert_eq!(router.peek_session("sess-1"), Some(worker(1, 0)));
+        assert!(router.peek_rebind_token("sess-1").is_some());
+        assert!(!router.in_rebind_cooldown("sess-1", Duration::from_secs(5)));
+
+        let transition = router
+            .begin_rebind("sess-1", expected, worker(1, 1), Duration::from_secs(300))
+            .unwrap();
+        router.bind(
+            "sess-1",
+            worker(9, 0),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        assert!(!router.rollback_rebind("sess-1", transition));
+        assert_eq!(router.peek_session("sess-1"), Some(worker(9, 0)));
+    }
+
+    #[test]
+    fn shadow_commit_does_not_overwrite_concurrent_put_or_remove() {
+        let store = InMemoryAffinityStore {
+            map: Arc::new(DashMap::new()),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+        let expected = router.bind(
+            "sess-put",
+            worker(1, 0),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        let transition = router
+            .begin_rebind("sess-put", expected, worker(1, 1), Duration::from_secs(300))
+            .unwrap();
+        router.bind(
+            "sess-put",
+            worker(9, 0),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        assert!(!router.commit_rebind("sess-put", transition));
+        assert_eq!(router.peek_session("sess-put"), Some(worker(9, 0)));
+
+        let expected = router.bind(
+            "sess-remove",
+            worker(2, 0),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        let transition = router
+            .begin_rebind(
+                "sess-remove",
+                expected,
+                worker(2, 1),
+                Duration::from_secs(300),
+            )
+            .unwrap();
+        assert!(router.unbind("sess-remove").is_some());
+        assert!(!router.commit_rebind("sess-remove", transition));
+        assert_eq!(router.peek_session("sess-remove"), None);
+    }
+
+    #[test]
+    fn engine_backed_cross_worker_rebind_fails_closed() {
+        let store = InMemoryAffinityStore {
+            map: Arc::new(DashMap::new()),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+        let expected = router.bind(
+            "sess-1",
+            worker(1, 0),
+            Duration::from_secs(300),
+            AffinityKind::EngineBacked,
+        );
+
+        assert!(
+            router
+                .begin_rebind("sess-1", expected, worker(2, 0), Duration::from_secs(300),)
+                .is_none()
+        );
+        assert_eq!(router.peek_session("sess-1"), Some(worker(1, 0)));
     }
 
     #[test]
@@ -614,6 +908,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
                 kind: AffinityKind::EngineBacked,
                 revision: 1,
+                pending_rebind: None,
             },
         );
         let router = StickySessionRouter::new(store);
@@ -636,6 +931,7 @@ mod tests {
                 expires_at: Instant::now() + Duration::from_secs(5),
                 kind: AffinityKind::EngineBacked,
                 revision: 1,
+                pending_rebind: None,
             },
         );
         let store = InMemoryAffinityStore {
@@ -680,6 +976,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
                 kind: AffinityKind::EngineBacked,
                 revision: 1,
+                pending_rebind: None,
             },
         );
         let router = StickySessionRouter::new(store);
@@ -715,6 +1012,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
                 kind: AffinityKind::RouterOnly,
                 revision: 1,
+                pending_rebind: None,
             },
         );
         let router = StickySessionRouter::new(store);
@@ -747,6 +1045,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
                 kind: AffinityKind::EngineBacked,
                 revision: 1,
+                pending_rebind: None,
             },
         );
 
@@ -791,6 +1090,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
                 kind: AffinityKind::EngineBacked,
                 revision: 1,
+                pending_rebind: None,
             },
         );
 
@@ -827,6 +1127,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
                 kind: AffinityKind::RouterOnly,
                 revision: 1,
+                pending_rebind: None,
             },
         );
 

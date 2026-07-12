@@ -17,6 +17,7 @@ from dynamo.common.constants import EmbeddingTransferMode
 from dynamo.sglang._compat import (
     ensure_sglang_top_level_exports,
     filter_supported_async_generate_kwargs,
+    supports_explicit_async_generate_kwarg,
 )
 from dynamo.sglang.args import (
     _normalize_multimodal_disaggregation_args,
@@ -145,6 +146,24 @@ def test_compat_keeps_async_generate_kwargs_for_variadic_engines():
     kwargs = {"return_routed_experts": True}
 
     assert filter_supported_async_generate_kwargs(VariadicEngine(), kwargs) == kwargs
+
+
+def test_capability_probe_requires_explicit_async_generate_kwarg():
+    class ExplicitEngine:
+        async def async_generate(self, migrate_from=None, **kwargs):
+            return None
+
+    class OldEngine:
+        async def async_generate(self, input_ids=None):
+            return None
+
+    class VariadicEngine:
+        async def async_generate(self, **kwargs):
+            return None
+
+    assert supports_explicit_async_generate_kwarg(ExplicitEngine(), "migrate_from")
+    assert not supports_explicit_async_generate_kwarg(OldEngine(), "migrate_from")
+    assert not supports_explicit_async_generate_kwarg(VariadicEngine(), "migrate_from")
 
 
 def test_routed_experts_kwarg_omitted_when_flag_off():
@@ -662,6 +681,41 @@ async def test_register_model_uses_metadata_only_for_sglang_modelexpress(monkeyp
 
     assert result is True
     assert captured["kwargs"]["ignore_weights"] is True
+
+
+def test_prefill_completion_ack_capability_requires_migration_api():
+    if sglang_register is None:
+        pytest.skip("dynamo.sglang.register is unavailable")
+
+    class MigrationEngine:
+        async def async_generate(self, migrate_from=None):
+            return None
+
+    class LegacyEngine:
+        async def async_generate(self, input_ids=None, sampling_params=None):
+            return None
+
+    text_config = _make_sglang_config()
+    assert sglang_register._supports_prefill_completion_ack(
+        MigrationEngine(),
+        SimpleNamespace(disaggregation_mode="prefill"),
+        text_config,
+    )
+    assert not sglang_register._supports_prefill_completion_ack(
+        LegacyEngine(),
+        SimpleNamespace(disaggregation_mode="prefill"),
+        text_config,
+    )
+    assert not sglang_register._supports_prefill_completion_ack(
+        MigrationEngine(),
+        SimpleNamespace(disaggregation_mode="decode"),
+        text_config,
+    )
+    assert not sglang_register._supports_prefill_completion_ack(
+        MigrationEngine(),
+        SimpleNamespace(disaggregation_mode="prefill"),
+        _make_sglang_config(multimodal_worker=True),
+    )
 
 
 @pytest.mark.asyncio

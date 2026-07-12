@@ -572,6 +572,7 @@ impl RoutingOverheadMetrics {
 /// independently.
 pub struct RouterRequestMetrics {
     pub requests_total: prometheus::IntCounter,
+    pub(crate) rebind_transitions_total: prometheus::IntCounterVec,
     pub time_to_first_token_seconds: prometheus::Histogram,
     pub inter_token_latency_seconds: prometheus::Histogram,
     pub input_sequence_tokens: prometheus::Histogram,
@@ -580,6 +581,55 @@ pub struct RouterRequestMetrics {
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
+}
+
+const REBIND_TRANSITIONS_TOTAL: &str = "rebind_transitions_total";
+
+/// Fixed transition taxonomy for the Layer-2 session rebind state machine.
+/// Keeping the complete `(state, reason)` set in an enum prevents accidental
+/// request IDs, error strings, or other high-cardinality labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RebindTransition {
+    DecisionLoadImbalance,
+    CommitPrefillCompleteAck,
+    AbortTrackingError,
+    AbortPrepareError,
+    AbortRouteError,
+    AbortDispatchError,
+    AbortContextStopped,
+    AbortAnnotatedError,
+    AbortLlmError,
+    AbortCancelled,
+    AbortAckBeforeBootstrap,
+    AbortCasConflict,
+    AbortMissingAck,
+    AbortStreamDropped,
+}
+
+impl RebindTransition {
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::DecisionLoadImbalance => ("decision", "load_imbalance"),
+            Self::CommitPrefillCompleteAck => ("commit", "prefill_complete_ack"),
+            Self::AbortTrackingError => ("abort", "tracking_error"),
+            Self::AbortPrepareError => ("abort", "prepare_error"),
+            Self::AbortRouteError => ("abort", "route_error"),
+            Self::AbortDispatchError => ("abort", "dispatch_error"),
+            Self::AbortContextStopped => ("abort", "context_stopped"),
+            Self::AbortAnnotatedError => ("abort", "annotated_error"),
+            Self::AbortLlmError => ("abort", "llm_error"),
+            Self::AbortCancelled => ("abort", "cancelled"),
+            Self::AbortAckBeforeBootstrap => ("abort", "ack_before_bootstrap"),
+            Self::AbortCasConflict => ("abort", "cas_conflict"),
+            Self::AbortMissingAck => ("abort", "missing_ack"),
+            Self::AbortStreamDropped => ("abort", "stream_dropped"),
+        }
+    }
+}
+
+pub(crate) fn record_rebind_transition(counter: &IntCounterVec, transition: RebindTransition) {
+    let (state, reason) = transition.labels();
+    counter.with_label_values(&[state, reason]).inc();
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -611,6 +661,14 @@ impl RouterRequestMetrics {
                         extra_labels,
                     )
                     .expect("failed to create router_requests_total");
+                let rebind_transitions_total = metrics
+                    .create_intcountervec(
+                        &router_metric(REBIND_TRANSITIONS_TOTAL),
+                        "Total number of Layer-2 session rebind state transitions",
+                        &["state", "reason"],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_rebind_transitions_total");
                 let time_to_first_token_seconds = metrics
                     .create_histogram(
                         &router_metric(frontend_service::TIME_TO_FIRST_TOKEN_SECONDS),
@@ -677,6 +735,7 @@ impl RouterRequestMetrics {
                     .expect("failed to create router_shared_cache_beyond_blocks");
                 Arc::new(Self {
                     requests_total,
+                    rebind_transitions_total,
                     time_to_first_token_seconds,
                     inter_token_latency_seconds,
                     input_sequence_tokens,
@@ -688,6 +747,10 @@ impl RouterRequestMetrics {
                 })
             })
             .clone()
+    }
+
+    pub(crate) fn record_rebind_transition(&self, transition: RebindTransition) {
+        record_rebind_transition(&self.rebind_transitions_total, transition);
     }
 }
 
@@ -749,6 +812,39 @@ mod tests {
         let mut buffer = Vec::new();
         encoder.encode(&registry.gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
+    }
+
+    #[test]
+    fn test_rebind_transition_metric_has_fixed_state_reason_taxonomy() {
+        let registry = prometheus::Registry::new();
+        let counter = IntCounterVec::new(
+            Opts::new(
+                REBIND_TRANSITIONS_TOTAL,
+                "Total number of Layer-2 session rebind state transitions",
+            ),
+            &["state", "reason"],
+        )
+        .unwrap();
+        registry.register(Box::new(counter.clone())).unwrap();
+
+        record_rebind_transition(&counter, RebindTransition::DecisionLoadImbalance);
+        record_rebind_transition(&counter, RebindTransition::CommitPrefillCompleteAck);
+        record_rebind_transition(&counter, RebindTransition::AbortMissingAck);
+        record_rebind_transition(&counter, RebindTransition::AbortMissingAck);
+
+        let output = gather_pef(&registry);
+        assert!(
+            output.contains(
+                "rebind_transitions_total{reason=\"load_imbalance\",state=\"decision\"} 1"
+            )
+        );
+        assert!(output.contains(
+            "rebind_transitions_total{reason=\"prefill_complete_ack\",state=\"commit\"} 1"
+        ));
+        assert!(
+            output.contains("rebind_transitions_total{reason=\"missing_ack\",state=\"abort\"} 2")
+        );
+        assert_eq!(output.matches("rebind_transitions_total{").count(), 3);
     }
 
     #[test]

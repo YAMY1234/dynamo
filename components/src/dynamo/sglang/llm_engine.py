@@ -36,6 +36,16 @@ from dynamo._core import Context
 from dynamo.common.backend import logprobs as _shared_logprobs
 from dynamo.common.backend import telemetry
 from dynamo.common.backend.dp_rank import forced_dp_rank, validate_global_dp_rank
+from dynamo.common.backend.disagg import (
+    PREFILL_COMPLETE_CAPABILITY_KEY,
+    PREFILL_TERMINAL_FAILURE,
+    PREFILL_TERMINAL_PENDING,
+    PREFILL_TERMINAL_SUCCESS,
+    PREFILL_TERMINAL_UNKNOWN,
+    classify_prefill_terminal,
+    prefill_complete_marker,
+    run_prefill_before_ack_test_hook,
+)
 from dynamo.common.backend.engine import (
     DYN_ENABLE_TEST_LOGITS_PROCESSOR,
     EngineConfig,
@@ -59,7 +69,10 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.common.utils.input_params import InputParamManager
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.llm import ModelInput
-from dynamo.sglang._compat import get_scheduler_info
+from dynamo.sglang._compat import (
+    get_scheduler_info,
+    supports_explicit_async_generate_kwarg,
+)
 from dynamo.sglang._disagg import (
     SGLANG_WORKER_GROUP_ID_KEY,
     compute_bootstrap_address,
@@ -92,11 +105,19 @@ def _warmup_enabled() -> bool:
     return raw.strip().lower() not in ("1", "true", "yes", "on")
 
 
-def _get_runtime_data(server_args) -> dict[str, Any] | None:
+def _get_runtime_data(
+    server_args,
+    serving_mode: DisaggregationMode | None = None,
+    *,
+    supports_migrate_from: bool = False,
+) -> dict[str, Any] | None:
+    runtime_data: dict[str, Any] = {}
     worker_group_id = get_sglang_worker_group_id(server_args)
-    if worker_group_id is None:
-        return None
-    return {SGLANG_WORKER_GROUP_ID_KEY: worker_group_id}
+    if worker_group_id is not None:
+        runtime_data[SGLANG_WORKER_GROUP_ID_KEY] = worker_group_id
+    if serving_mode == DisaggregationMode.PREFILL and supports_migrate_from:
+        runtime_data[PREFILL_COMPLETE_CAPABILITY_KEY] = True
+    return runtime_data or None
 
 
 def _local_dp_rank_range(server_args) -> tuple[int, int]:
@@ -110,6 +131,7 @@ class SglangLLMEngine(LLMEngine):
     # Class-level default so ``__new__``-built instances (tests skipping
     # ``__init__``) still expose what ``generate()`` reads; ``start()`` sets it.
     _logits_processor_spec: "LogitsProcessorSpec | None" = None
+    _engine_supports_migrate_from: bool = False
 
     def __init__(self, server_args, dynamo_args, serving_mode: DisaggregationMode):
         self.server_args = server_args
@@ -143,6 +165,7 @@ class SglangLLMEngine(LLMEngine):
         self._dp_start: int = 0
         self._dp_size: int = 1
         self._logits_processor_spec: LogitsProcessorSpec | None = None
+        self._engine_supports_migrate_from = False
         self._pause_controller: SGLangEnginePauseController | None = None
         self._pause_lock = asyncio.Lock()
 
@@ -185,6 +208,9 @@ class SglangLLMEngine(LLMEngine):
         # shim suppresses those centrally (worker.py::_guard_loop_signal_handlers)
         # so they can't override the Rust Worker's shutdown; nothing to do here.
         self.engine = sgl.Engine(server_args=self.server_args)
+        self._engine_supports_migrate_from = supports_explicit_async_generate_kwarg(
+            self.engine, "migrate_from"
+        )
         self._pause_controller = SGLangEnginePauseController(self.engine)
 
         tokenizer = (
@@ -230,7 +256,11 @@ class SglangLLMEngine(LLMEngine):
         return EngineConfig(
             model=self.server_args.model_path,
             served_model_name=self.server_args.served_model_name,
-            runtime_data=_get_runtime_data(self.server_args),
+            runtime_data=_get_runtime_data(
+                self.server_args,
+                self.serving_mode,
+                supports_migrate_from=self._engine_supports_migrate_from,
+            ),
             llm=LlmRegistration(
                 context_length=self.server_args.context_length,
                 kv_cache_block_size=page_size,
@@ -397,13 +427,14 @@ class SglangLLMEngine(LLMEngine):
                 enabled=self.enable_trace,
             ),
             **bootstrap_kwargs,
+            **self._migrate_from_kwargs(request),
             **logits_kwargs,
             **logprob_kwargs,
         )
 
-        # ORDER MATTERS: async_generate must register the room (the await
-        # above) before we yield the bootstrap chunk — otherwise the
-        # decode peer can connect to a room that doesn't exist yet.
+        # SGLang may return a lazy inner generator here. The synthetic
+        # bootstrap is therefore a routing coordinate, not proof that the room
+        # is ready; only the terminal completion marker below is authoritative.
         if self.serving_mode == DisaggregationMode.PREFILL:
             # Canary probes: drain the engine stream and yield a single
             # terminal so `HealthCheckManager` observes actual engine
@@ -430,11 +461,18 @@ class SglangLLMEngine(LLMEngine):
                     return
                 yield {"token_ids": [], "index": 0, "finish_reason": "stop"}
                 return
-            yield {
-                "token_ids": [],
-                "index": 0,
-                "disaggregated_params": dict(bootstrap_kwargs),
-            }
+            try:
+                yield {
+                    "token_ids": [],
+                    "index": 0,
+                    "disaggregated_params": dict(bootstrap_kwargs),
+                }
+            except (GeneratorExit, asyncio.CancelledError):
+                # No drain task exists yet, so this generator owns best-effort
+                # cleanup whether the SGLang inner stream is eager or lazy.
+                self._abort_sglang_request(context.trace_id)
+                await self._close_prefill_stream(stream, context.trace_id)
+                raise
             # Count this stream in-flight now, before the spawn/await below.
             # Incrementing inside _consume_prefill_stream instead would leave a
             # create_task -> first-run gap where is_quiescent() reads 0 and the
@@ -446,7 +484,22 @@ class SglangLLMEngine(LLMEngine):
             # Completed path: router awaits our stream end before
             # forwarding to decode — a sync drain deadlocks, so spawn.
             if request.get("bootstrap_info"):
-                await self._consume_prefill_stream(stream, context, context.trace_id)
+                await self._consume_prefill_stream(
+                    stream,
+                    context,
+                    context.trace_id,
+                    propagate_errors=True,
+                )
+                if context.is_stopped():
+                    self._abort_sglang_request(context.trace_id)
+                    raise asyncio.CancelledError(
+                        "prefill stopped before completion ACK"
+                    )
+                await run_prefill_before_ack_test_hook(request, context.id())
+                # The bootstrap chunk only confirms room registration. This
+                # marker is the router's cold-affinity commit boundary and must
+                # follow successful migration or full-prefill fallback.
+                yield prefill_complete_marker()
                 return
             task = asyncio.create_task(
                 self._consume_prefill_stream(stream, context, context.trace_id)
@@ -745,6 +798,28 @@ class SglangLLMEngine(LLMEngine):
             self.engine.shutdown()
             logger.info("SGLang engine shutdown")
 
+    def _migrate_from_kwargs(self, request: GenerateRequest) -> dict[str, Any]:
+        migrate_from = request.get("migrate_from")
+        if migrate_from is None:
+            return {}
+        if not self._engine_supports_migrate_from:
+            raise RuntimeError(
+                "SGLang async_generate does not support migrate_from; "
+                "refusing an incomplete session rebind"
+            )
+        if not isinstance(migrate_from, (list, tuple)) or len(migrate_from) != 2:
+            raise ValueError("migrate_from must be [source_endpoint, source_dp_rank]")
+        source_endpoint, source_dp_rank = migrate_from
+        if not isinstance(source_endpoint, str) or not source_endpoint:
+            raise ValueError("migrate_from source_endpoint must be a non-empty string")
+        if (
+            isinstance(source_dp_rank, bool)
+            or not isinstance(source_dp_rank, int)
+            or source_dp_rank < 0
+        ):
+            raise ValueError("migrate_from source_dp_rank must be a non-negative int")
+        return {"migrate_from": (source_endpoint, source_dp_rank)}
+
     def _resolve_prefill_bootstrap(self, request: GenerateRequest) -> dict[str, Any]:
         """Pick the (host, port, room) triple this prefill request will use.
 
@@ -821,6 +896,8 @@ class SglangLLMEngine(LLMEngine):
         stream: AsyncGenerator[Any, None],
         context: Context,
         rid: str | None,
+        *,
+        propagate_errors: bool = False,
     ) -> None:
         """Drain a prefill engine stream after the bootstrap chunk is yielded.
         Awaited inline on the bootstrap path, spawned as a task on the completed
@@ -832,11 +909,43 @@ class SglangLLMEngine(LLMEngine):
         ``generate`` increments ``_inflight_prefill_streams`` before this runs;
         the ``finally`` here decrements it.
         """
+        saw_result = False
+        final_state = PREFILL_TERMINAL_PENDING
         try:
-            async for _ in stream:
+            async for result in stream:
                 if context.is_stopped():
-                    break
+                    if propagate_errors:
+                        raise asyncio.CancelledError(
+                            "prefill stopped before completion ACK"
+                        )
+                    self._abort_sglang_request(rid)
+                    await self._close_prefill_stream(stream, rid)
+                    return
+                saw_result = True
+                final_state = classify_prefill_terminal(result)
+                if final_state == PREFILL_TERMINAL_FAILURE:
+                    raise RuntimeError("SGLang prefill stream ended with abort/error")
+                if final_state == PREFILL_TERMINAL_UNKNOWN:
+                    raise RuntimeError(
+                        "SGLang prefill stream returned an unknown finish reason"
+                    )
+
+            if context.is_stopped():
+                self._abort_sglang_request(rid)
+                if propagate_errors:
+                    raise asyncio.CancelledError(
+                        "prefill stopped before completion ACK"
+                    )
+                return
+            if not saw_result:
+                raise RuntimeError("SGLang prefill stream returned no results")
+            if final_state != PREFILL_TERMINAL_SUCCESS:
+                raise RuntimeError(
+                    "SGLang prefill stream ended without a successful terminal"
+                )
         except asyncio.CancelledError:
+            self._abort_sglang_request(rid)
+            await self._close_prefill_stream(stream, rid)
             raise
         except Exception:
             # Abort releases the bootstrap room so the decode peer fails
@@ -848,8 +957,26 @@ class SglangLLMEngine(LLMEngine):
                 exc_info=True,
             )
             self._abort_sglang_request(rid)
+            await self._close_prefill_stream(stream, rid)
+            if propagate_errors:
+                raise
         finally:
             self._inflight_prefill_streams -= 1
+
+    async def _close_prefill_stream(
+        self, stream: AsyncGenerator[Any, None], rid: str | None
+    ) -> None:
+        close = getattr(stream, "aclose", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except (Exception, asyncio.CancelledError):
+            logger.debug(
+                "failed to close prefill stream (rid=%s)",
+                rid,
+                exc_info=True,
+            )
 
     def _abort_sglang_request(self, rid: Optional[str]) -> None:
         """Best-effort abort. Failures here are swallowed — SGLang is

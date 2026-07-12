@@ -55,6 +55,7 @@ class GenerateRequest(TypedDict, total=False):
     output_options: dict[str, Any]
     prefill_result: dict[str, Any]
     bootstrap_info: dict[str, Any]
+    migrate_from: list[Any]
     extra_args: dict[str, Any]
 
 
@@ -78,6 +79,9 @@ class GenerateChunk(TypedDict, total=False):
     disaggregated_params: dict[str, Any]
     log_probs: list[float]
     top_logprobs: list[list[dict[str, Any]]]
+    # Internal backend-to-router metadata. This is deserialized into Rust
+    # `LLMEngineOutput.extra_args` and is not part of the client response.
+    extra_args: dict[str, Any]
     # Forwarded verbatim to Rust `LLMEngineOutput.engine_data` as a
     # JSON object. Carries `prompt_logprobs` on the final chunk.
     engine_data: dict[str, Any]
