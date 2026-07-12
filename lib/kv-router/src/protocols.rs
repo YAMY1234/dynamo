@@ -1871,7 +1871,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_string(&load).unwrap(),
-            r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4,"active_requests":2}"#
+            r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4,"active_requests":2,"request_prefill_delta":0}"#
         );
     }
 }
