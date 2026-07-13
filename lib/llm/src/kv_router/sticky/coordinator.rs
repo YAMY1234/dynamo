@@ -10,7 +10,6 @@ use anyhow::Result;
 use dashmap::DashMap;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_runtime::component::Component;
-use dynamo_runtime::error::{DynamoError, ErrorType};
 
 use crate::{
     preprocessor::PreprocessedRequest,
@@ -51,12 +50,25 @@ pub(crate) struct SessionRebindGuard {
 /// A rebind snapshots the hot prefix and may publish a cold owner when prefill
 /// completes. Allowing another turn to mutate the hot owner in that window can
 /// make the cold snapshot stale even when the affinity revision itself did not
-/// change. The first implementation therefore fails concurrent turns closed;
-/// a shared/queued implementation can replace this local guard later.
+/// change. Only the turn owner is rebind-eligible; an overlapping turn follows
+/// the visible binding instead of being rejected (non-closed-loop clients
+/// legitimately overlap turns of one session).
 pub(crate) struct SessionTurnGuard {
     turns: Arc<DashMap<String, String>>,
     session_id: String,
     owner: String,
+}
+
+/// Outcome of a turn-ownership attempt for a sticky session.
+pub(crate) enum TurnAcquisition {
+    /// Request has no sticky turn semantics for this phase.
+    NotApplicable,
+    /// This request now owns the session's turn and is rebind-eligible.
+    Owner(SessionTurnGuard),
+    /// Another request owns the turn. The caller must follow the visible
+    /// binding and skip rebind evaluation so the owner's snapshot window
+    /// cannot be raced.
+    Overlap,
 }
 
 impl Drop for SessionTurnGuard {
@@ -113,45 +125,39 @@ impl StickySessionCoordinator {
         }
     }
 
-    /// Acquire exclusive ownership of a sticky session turn for `phase`.
+    /// Acquire ownership of a sticky session turn for `phase`.
     /// Requests without session control do not need a guard.
     pub(crate) fn acquire_turn_for_phase(
         &self,
         request: &PreprocessedRequest,
         phase: RequestPhase,
         owner: &str,
-    ) -> Result<Option<SessionTurnGuard>> {
+    ) -> TurnAcquisition {
         use dashmap::mapref::entry::Entry;
 
         let Some(session_id) = turn_session_id_for_phase(request, phase) else {
-            return Ok(None);
+            return TurnAcquisition::NotApplicable;
         };
         let session_id = session_id.to_owned();
         match self.prefill_turns.entry(session_id.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(owner.to_owned());
-                Ok(Some(SessionTurnGuard {
+                TurnAcquisition::Owner(SessionTurnGuard {
                     turns: self.prefill_turns.clone(),
                     session_id,
                     owner: owner.to_owned(),
-                }))
+                })
             }
             Entry::Occupied(entry) => {
                 let current_owner = entry.get().to_owned();
-                tracing::warn!(
+                tracing::info!(
                     %session_id,
                     phase = %phase,
                     request_id = %owner,
                     %current_owner,
-                    "Rejected concurrent sticky session turn"
+                    "sticky session turn overlap: following existing binding, not rebind-eligible"
                 );
-                Err(DynamoError::builder()
-                    .error_type(ErrorType::InvalidArgument)
-                    .message(format!(
-                        "sticky session {session_id} already has an in-flight {phase} turn owned by {current_owner}"
-                    ))
-                    .build()
-                    .into())
+                TurnAcquisition::Overlap
             }
         }
     }

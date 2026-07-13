@@ -23,7 +23,9 @@ use crate::{
         KvRouter,
         metrics::{RebindTransition, RouterRequestMetrics, record_rebind_transition},
         sticky::{
-            coordinator::{SessionRebindGuard, SessionTurnGuard, StickySessionCoordinator},
+            coordinator::{
+                SessionRebindGuard, SessionTurnGuard, StickySessionCoordinator, TurnAcquisition,
+            },
             router::{AffinityBindingToken, AffinityKind},
         },
     },
@@ -1078,16 +1080,30 @@ impl KvPushRouter {
     ) -> Result<PrefillSelection, Error> {
         let phase = RequestPhase::Prefill;
         let context_id = request.context().id().to_string();
-        let session_turn = self
-            .sticky
-            .acquire_turn_for_phase(request, phase, &context_id)?;
-        if request
-            .routing
-            .as_ref()
-            .and_then(|routing| routing.session_control.as_ref())
-            .and_then(|session| session.action.as_ref())
-            .is_some()
-        {
+        let (session_turn, turn_overlap) =
+            match self
+                .sticky
+                .acquire_turn_for_phase(request, phase, &context_id)
+            {
+                TurnAcquisition::Owner(guard) => (Some(guard), false),
+                TurnAcquisition::NotApplicable => (None, false),
+                TurnAcquisition::Overlap => (None, true),
+            };
+        // Lifecycle mutations (Open/Close) must reach the visible binding
+        // untouched, and an overlapping turn must not race the owner's rebind
+        // window. Both follow the plain sticky selection. A per-turn idempotent
+        // Bind with turn ownership stays rebind-eligible (mirrors the gate in
+        // check_rebind_decision — a Bind blocked here never reaches it).
+        let lifecycle_action = matches!(
+            request
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.session_control.as_ref())
+                .and_then(|session| session.action.as_ref()),
+            Some(crate::protocols::common::extensions::SessionAction::Open)
+                | Some(crate::protocols::common::extensions::SessionAction::Close)
+        );
+        if turn_overlap || lifecycle_action {
             return Ok(PrefillSelection {
                 selection: self.select_request(request, phase, false).await?,
                 pending_rebind: None,
@@ -1798,7 +1814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_session_turn_is_rejected_while_rebind_is_pending_then_released() {
+    async fn pinned_turn_overlap_follows_pin_without_rebind_while_owner_holds_turn() {
         pin_rebind_trigger_env_for_tests();
         let router = make_dp_test_router().await;
         let hot = WorkerWithDpRank::new(42, 0);
@@ -1843,11 +1859,16 @@ mod tests {
             "serialized-second".to_string(),
             Default::default(),
         );
-        let error = match router.select_prefill_request(&mut second).await {
-            Ok(_) => panic!("concurrent turn unexpectedly acquired the session"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("already has an in-flight prefill turn"));
+        let PrefillSelection {
+            selection: overlap_selection,
+            pending_rebind: overlap_rebind,
+            session_turn: overlap_turn,
+        } = router.select_prefill_request(&mut second).await.unwrap();
+        assert_eq!(overlap_selection.instance_id, hot.worker_id);
+        assert_eq!(overlap_selection.dp_rank, hot.dp_rank);
+        assert!(overlap_rebind.is_none(), "overlap turn must not rebind");
+        assert!(overlap_turn.is_none(), "overlap turn must not own the session");
+        router.chooser.free("serialized-second").await.unwrap();
 
         let mut backend_pinned_request = session_request("serialized-session", None, 64);
         let routing = backend_pinned_request.routing.as_mut().unwrap();
@@ -1858,11 +1879,16 @@ mod tests {
             "serialized-backend-pinned".to_string(),
             Default::default(),
         );
-        let error = match router.select_prefill_request(&mut backend_pinned).await {
-            Ok(_) => panic!("backend-pinned turn unexpectedly acquired the session"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("already has an in-flight prefill turn"));
+        let PrefillSelection {
+            selection: backend_overlap_selection,
+            pending_rebind: backend_overlap_rebind,
+            session_turn: backend_overlap_turn,
+        } = router.select_prefill_request(&mut backend_pinned).await.unwrap();
+        assert_eq!(backend_overlap_selection.instance_id, hot.worker_id);
+        assert_eq!(backend_overlap_selection.dp_rank, hot.dp_rank);
+        assert!(backend_overlap_rebind.is_none());
+        assert!(backend_overlap_turn.is_none());
+        router.chooser.free("serialized-backend-pinned").await.unwrap();
         assert_eq!(
             router
                 .sticky
@@ -1889,7 +1915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actionless_session_turn_rejection_preserves_accounting_and_allows_reacquire() {
+    async fn actionless_turn_overlap_follows_binding_and_owner_reacquires() {
         pin_rebind_trigger_env_for_tests();
         let router = make_dp_test_router().await;
         let hot = WorkerWithDpRank::new(42, 0);
@@ -1932,27 +1958,23 @@ mod tests {
             "actionless-second".to_string(),
             Default::default(),
         );
-        let error = match router.select_prefill_request(&mut second).await {
-            Ok(_) => panic!("concurrent actionless turn unexpectedly acquired the session"),
-            Err(error) => error,
-        };
-        let typed = error
-            .downcast_ref::<dynamo_runtime::error::DynamoError>()
-            .expect("concurrent session turn must return a typed client error");
+        let PrefillSelection {
+            selection: overlap_selection,
+            pending_rebind: overlap_rebind,
+            session_turn: overlap_turn,
+        } = router.select_prefill_request(&mut second).await.unwrap();
         assert_eq!(
-            typed.error_type(),
-            dynamo_runtime::error::ErrorType::InvalidArgument
+            overlap_selection.instance_id, hot.worker_id,
+            "overlap turn must follow the visible binding"
         );
-        assert!(
-            error
-                .to_string()
-                .contains("already has an in-flight prefill turn")
-        );
-        assert!(error.to_string().contains("actionless-first"));
+        assert_eq!(overlap_selection.dp_rank, hot.dp_rank);
+        assert!(overlap_rebind.is_none(), "overlap turn must not rebind");
+        assert!(overlap_turn.is_none(), "overlap turn must not own the session");
+        router.chooser.free("actionless-second").await.unwrap();
         assert_eq!(
             load_snapshot(&router).await,
             held_snapshot,
-            "a rejected turn must not add a second scheduler booking"
+            "an overlap turn books and releases exactly once"
         );
 
         drop(first_rebind);
@@ -1977,6 +1999,55 @@ mod tests {
         );
 
         router.chooser.free("actionless-hot-load").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_action_turn_stays_rebind_eligible() {
+        pin_rebind_trigger_env_for_tests();
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        router
+            .chooser
+            .add_request(
+                "bind-hot-load".to_string(),
+                &vec![1; 8192],
+                None,
+                0,
+                None,
+                hot,
+                None,
+                None,
+            )
+            .await;
+        let bind_request = session_request("bind-eligible-session", Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&bind_request, hot, "bind-bind-eligible-session")
+            .await
+            .unwrap();
+
+        // A per-turn idempotent Bind — what conv-aware clients send on every
+        // turn — must reach rebind evaluation exactly like an actionless turn.
+        // Only Open/Close lifecycle mutations bypass it.
+        let mut turn = Context::with_id_and_metadata(
+            session_request("bind-eligible-session", Some(SessionAction::Bind), 128),
+            "bind-eligible-turn".to_string(),
+            Default::default(),
+        );
+        let PrefillSelection {
+            pending_rebind,
+            session_turn,
+            ..
+        } = router.select_prefill_request(&mut turn).await.unwrap();
+        assert!(
+            pending_rebind.is_some(),
+            "Bind turn must stay rebind-eligible end-to-end"
+        );
+        assert!(session_turn.is_some());
+        drop(pending_rebind);
+        drop(session_turn);
+        router.chooser.free("bind-eligible-turn").await.unwrap();
+        router.chooser.free("bind-hot-load").await.unwrap();
     }
 
     #[tokio::test]
