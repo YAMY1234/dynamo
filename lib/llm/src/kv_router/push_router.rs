@@ -59,6 +59,11 @@ const REBIND_MIN_NEW_TOKENS_DEFAULT: usize = 4096;
 // Bounce cap: each rebind costs a deferred turn + a transfer with
 // diminishing returns; stop ping-ponging a session after this many.
 const REBIND_MAX_PER_SESSION_DEFAULT: u32 = 4;
+// SGLang's per-rank migration token cap (prefill-migration-token-cap) refuses
+// transfers larger than this, all-or-nothing: rebinding a bigger session moves
+// it WITHOUT its KV and forces a full cold re-prefill — strictly worse than
+// staying hot. Must track the sglang-side cap.
+const REBIND_MAX_MIGRATION_TOKENS_DEFAULT: usize = 262144;
 
 fn rebind_min_new_tokens() -> usize {
     use std::sync::OnceLock;
@@ -91,6 +96,28 @@ fn rebind_hysteresis_tokens() -> usize {
             .and_then(|s| s.parse().ok())
             .unwrap_or(REBIND_HYSTERESIS_TOKENS_DEFAULT)
     })
+}
+
+fn rebind_max_migration_tokens() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_MAX_MIGRATION_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_MAX_MIGRATION_TOKENS_DEFAULT)
+    })
+}
+
+/// True when the session history (ISL minus this turn's uncached-on-hot
+/// tokens) exceeds the migration token cap — the migration layer would refuse
+/// the transfer, so a rebind could not carry its KV.
+fn session_history_exceeds_migration_cap(
+    isl: usize,
+    request_new_tokens: usize,
+    cap: usize,
+) -> bool {
+    isl.saturating_sub(request_new_tokens) > cap
 }
 
 /// Optional override for the source worker's migration peer host, used when the
@@ -926,6 +953,13 @@ impl KvPushRouter {
         let gap = hot_queue.saturating_sub(cold_queue);
         let hysteresis = rebind_hysteresis_tokens();
         let min_new_tokens = rebind_min_new_tokens();
+        // Upper bound on what a migration would have to move: the session
+        // history already cached on the hot rank (ISL minus this turn's
+        // uncached tokens).
+        let session_history = routing_parts
+            .token_ids
+            .len()
+            .saturating_sub(request_new_tokens);
         // DIAG (bounded to sticky requests with an existing binding): shows
         // whether the raw-backlog imbalance reached the trigger gates.
         tracing::info!(
@@ -936,6 +970,7 @@ impl KvPushRouter {
             gap,
             hysteresis,
             min_new_tokens,
+            session_history,
             "Layer-2 diag: raw backlog gap before trigger gates"
         );
         // Greedy load-shedding: small turns keep locality on the hot rank.
@@ -943,6 +978,23 @@ impl KvPushRouter {
             return None;
         }
         if gap <= hysteresis {
+            return None;
+        }
+        // The migration layer refuses transfers above its token cap
+        // (all-or-nothing): rebinding such a session moves it without its KV
+        // and forces a full cold re-prefill — strictly worse than staying.
+        let max_migration_tokens = rebind_max_migration_tokens();
+        if session_history_exceeds_migration_cap(
+            routing_parts.token_ids.len(),
+            request_new_tokens,
+            max_migration_tokens,
+        ) {
+            tracing::info!(
+                %session_id,
+                session_history,
+                max_migration_tokens,
+                "Layer-2 rebind skipped: session history exceeds the migration token cap"
+            );
             return None;
         }
         // Bounce cap + cooldown: avoid thrash on a session we keep moving.
@@ -1389,6 +1441,10 @@ mod tests {
             std::env::set_var("DYN_REBIND_MIN_NEW_TOKENS", "0");
             std::env::set_var("DYN_REBIND_HYSTERESIS_TOKENS", "256");
             std::env::set_var("DYN_REBIND_MAX_PER_SESSION", "100");
+            // Test loads carry request_prefill_delta=128, so histories stay 0
+            // for the standard 1..=128-token requests; only the dedicated
+            // oversized-history test crosses this.
+            std::env::set_var("DYN_REBIND_MAX_MIGRATION_TOKENS", "5000");
         }
     }
 
@@ -2048,6 +2104,32 @@ mod tests {
         drop(session_turn);
         router.chooser.free("bind-eligible-turn").await.unwrap();
         router.chooser.free("bind-hot-load").await.unwrap();
+    }
+
+    // The trigger's cap gate itself is a pure function; the router harness
+    // cannot exercise it end-to-end (use_kv_events=false means zero cache
+    // overlap, so request_prefill_delta == ISL and history is always 0).
+    // The live-path check is a run-audit item: frontend diag lines must carry
+    // session_history, and cc-traces giants must produce cap-skip lines.
+    #[test]
+    fn session_history_cap_gate_boundaries() {
+        // Mature session: 424k ISL with a 4k turn — history far above the cap.
+        assert!(session_history_exceeds_migration_cap(424_356, 4_096, 262_144));
+        // Exactly at the cap is still migratable (gate is strict-greater).
+        assert!(!session_history_exceeds_migration_cap(
+            262_144 + 4_096,
+            4_096,
+            262_144
+        ));
+        assert!(session_history_exceeds_migration_cap(
+            262_144 + 4_096 + 1,
+            4_096,
+            262_144
+        ));
+        // Young session: everything in this turn is new — nothing to migrate.
+        assert!(!session_history_exceeds_migration_cap(100_000, 100_000, 262_144));
+        // Delta larger than ISL (dest-side estimate drift) must not underflow.
+        assert!(!session_history_exceeds_migration_cap(1_000, 2_000, 262_144));
     }
 
     #[tokio::test]
