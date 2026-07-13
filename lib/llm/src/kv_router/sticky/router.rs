@@ -512,8 +512,22 @@ impl StickySessionRouter {
     }
 
     /// Discard a shadow rebind without disturbing a concurrent newer binding.
+    ///
+    /// Resets `last_rebind` to now so the cooldown window starts from the
+    /// rollback time, not from the original initiation.  Without this reset,
+    /// a session whose rebind always rolls back accumulates zero cooldown time
+    /// and can be rebinded repeatedly, creating a cold-prefill cascade.
     pub(crate) fn rollback_rebind(&self, session_id: &str, token: AffinityRebindToken) -> bool {
-        self.store.rollback_rebind(session_id, token)
+        let rolled = self.store.rollback_rebind(session_id, token);
+        // Reset the cooldown clock from the rollback instant so the trigger
+        // cannot fire again until the full cooldown has elapsed from *here*.
+        self.last_rebind
+            .insert(session_id.to_owned(), Instant::now());
+        tracing::info!(
+            %session_id,
+            "Layer-2 rebind cooldown reset on rollback"
+        );
+        rolled
     }
 
     /// Number of committed rebinds for this session (bounce cap input).

@@ -158,7 +158,21 @@ fn warn_cross_worker_migration_skipped(src: WorkerWithDpRank, dst: WorkerWithDpR
     }
 }
 /// Minimum interval between rebinds of the same session, to avoid thrash.
-const REBIND_COOLDOWN: Duration = Duration::from_secs(5);
+/// Measured from the later of: rebind initiation OR rollback time (the rollback
+/// resets the clock via `rollback_rebind`).  Set long enough to outlast a cold
+/// prefill plus at least one think-time gap; cc-traces cold prefills reach 50s.
+/// Override with DYN_REBIND_COOLDOWN_SECS.
+fn rebind_cooldown() -> Duration {
+    use std::sync::OnceLock;
+    static V: OnceLock<Duration> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_COOLDOWN_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(120))
+    })
+}
 /// Fallback TTL for a rebind when the request carries no session_control
 /// timeout (in practice sticky gating guarantees one is present).
 const REBIND_DEFAULT_TTL: Duration = Duration::from_secs(300);
@@ -1007,7 +1021,11 @@ impl KvPushRouter {
             );
             return None;
         }
-        if self.sticky.in_rebind_cooldown(&session_id, REBIND_COOLDOWN) {
+        if self.sticky.in_rebind_cooldown(&session_id, rebind_cooldown()) {
+            tracing::info!(
+                %session_id,
+                "Layer-2 rebind skipped: session in post-rollback cooldown"
+            );
             return None;
         }
 
@@ -1445,6 +1463,9 @@ mod tests {
             // for the standard 1..=128-token requests; only the dedicated
             // oversized-history test crosses this.
             std::env::set_var("DYN_REBIND_MAX_MIGRATION_TOKENS", "5000");
+            // Disable the post-rollback cooldown in tests so rapid rebinds
+            // fire without waiting 120 s.
+            std::env::set_var("DYN_REBIND_COOLDOWN_SECS", "0");
         }
     }
 
