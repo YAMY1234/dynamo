@@ -286,6 +286,28 @@ impl AffinityStore for InMemoryAffinityStore {
         ttl: Duration,
         kind: AffinityKind,
     ) -> AffinityBindingToken {
+        let now = Instant::now();
+        // Idempotent re-bind: a live entry with the same target is only a TTL
+        // refresh. Keeping the revision (and any pending shadow rebind) means a
+        // same-target Bind from an overlapping turn cannot invalidate an
+        // in-flight rebind's compare-and-set — only a genuine target change
+        // does. Replacing the entry here was why rebind commits never landed.
+        if let Some(mut entry) = self.map.get_mut(session_id)
+            && entry.expires_at > now
+            && entry.worker == worker
+            && entry.kind == kind
+        {
+            entry.ttl = ttl;
+            entry.expires_at = now + ttl;
+            tracing::info!(
+                %session_id,
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                "Sticky bind idempotent refresh (revision preserved)"
+            );
+            return entry.token();
+        }
+
         let revision = NEXT_AFFINITY_REVISION.fetch_add(1, Ordering::Relaxed);
         let binding = AffinityBinding { worker, kind };
         self.map.insert(
@@ -293,7 +315,7 @@ impl AffinityStore for InMemoryAffinityStore {
             AffinityEntry {
                 worker,
                 ttl,
-                expires_at: Instant::now() + ttl,
+                expires_at: now + ttl,
                 kind,
                 revision,
                 pending_rebind: None,
@@ -648,6 +670,74 @@ mod tests {
         assert_eq!(entry.ttl, Duration::from_secs(90));
         assert_eq!(entry.kind, AffinityKind::RouterOnly);
         assert!(entry.expires_at > Instant::now() + Duration::from_secs(80));
+    }
+
+    #[test]
+    fn same_target_put_is_idempotent_and_preserves_pending_rebind() {
+        let map = Arc::new(DashMap::new());
+        let store = InMemoryAffinityStore {
+            map: map.clone(),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+        let first = router.bind(
+            "sess-idem",
+            worker(42, 3),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        let transition = router
+            .begin_rebind("sess-idem", first, worker(42, 7), Duration::from_secs(300))
+            .unwrap();
+
+        // Same-target re-bind: revision unchanged, shadow survives.
+        let second = router.bind(
+            "sess-idem",
+            worker(42, 3),
+            Duration::from_secs(600),
+            AffinityKind::RouterOnly,
+        );
+        assert_eq!(second.revision, first.revision);
+        {
+            let entry = map.get("sess-idem").unwrap();
+            assert!(entry.pending_rebind.is_some());
+            assert_eq!(entry.ttl, Duration::from_secs(600));
+        }
+
+        assert!(router.commit_rebind("sess-idem", transition));
+        assert_eq!(router.peek_session("sess-idem"), Some(worker(42, 7)));
+    }
+
+    #[test]
+    fn different_target_put_still_invalidates_pending_rebind() {
+        let map = Arc::new(DashMap::new());
+        let store = InMemoryAffinityStore {
+            map: map.clone(),
+            on_expire: None,
+        };
+        let router = StickySessionRouter::new(store);
+        let first = router.bind(
+            "sess-diff",
+            worker(42, 3),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        let transition = router
+            .begin_rebind("sess-diff", first, worker(42, 7), Duration::from_secs(300))
+            .unwrap();
+
+        // Genuine target change: revision bumps, shadow is destroyed, and the
+        // stale transition must not commit over the newer binding.
+        let second = router.bind(
+            "sess-diff",
+            worker(42, 1),
+            Duration::from_secs(300),
+            AffinityKind::RouterOnly,
+        );
+        assert_ne!(second.revision, first.revision);
+        assert!(map.get("sess-diff").unwrap().pending_rebind.is_none());
+        assert!(!router.commit_rebind("sess-diff", transition));
+        assert_eq!(router.peek_session("sess-diff"), Some(worker(42, 1)));
     }
 
     #[test]

@@ -279,6 +279,23 @@ impl StickySessionCoordinator {
         worker: WorkerWithDpRank,
         context_id: &str,
     ) -> Result<SessionRoutingResult> {
+        self.on_routed_rebind_aware(request, worker, context_id, false)
+            .await
+    }
+
+    /// `on_routed` for the dispatch path, which knows whether this request is a
+    /// rebound turn. A rebound turn's own Bind must not touch the store: the
+    /// pending shadow already encodes old->cold and is published atomically on
+    /// the prefill-completion ACK. Binding the cold target here would replace
+    /// the visible entry, destroy the shadow, and fail the commit CAS — the
+    /// exact self-inflicted race that made every rebind roll back.
+    pub(crate) async fn on_routed_rebind_aware(
+        &self,
+        request: &PreprocessedRequest,
+        worker: WorkerWithDpRank,
+        context_id: &str,
+        rebind_in_flight: bool,
+    ) -> Result<SessionRoutingResult> {
         let sc = request
             .routing
             .as_ref()
@@ -328,6 +345,18 @@ impl StickySessionCoordinator {
                 })
             }
             SessionAction::Bind => {
+                if rebind_in_flight {
+                    tracing::info!(
+                        session_id = %sc.session_id,
+                        worker_id = worker.worker_id,
+                        dp_rank = worker.dp_rank,
+                        "Bind suppressed for rebound turn; shadow transition owns the binding"
+                    );
+                    return Ok(SessionRoutingResult {
+                        deferred_close: None,
+                        rollback: None,
+                    });
+                }
                 let binding_token = self.router.bind(
                     &sc.session_id,
                     worker,

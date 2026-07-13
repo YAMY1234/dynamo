@@ -64,6 +64,11 @@ const REBIND_MAX_PER_SESSION_DEFAULT: u32 = 4;
 // it WITHOUT its KV and forces a full cold re-prefill — strictly worse than
 // staying hot. Must track the sglang-side cap.
 const REBIND_MAX_MIGRATION_TOKENS_DEFAULT: usize = 262144;
+// Rescue path: min-new-tokens models load-shedding value (relief to the hot
+// rank ∝ this turn's new work), but a session stuck behind a backlog this
+// large is worth moving for its own latency regardless — its wait ∝ gap, not
+// ∝ new tokens, while the migration transfer runs ~10x faster than recompute.
+const REBIND_RESCUE_GAP_TOKENS_DEFAULT: usize = 131072;
 
 fn rebind_min_new_tokens() -> usize {
     use std::sync::OnceLock;
@@ -85,6 +90,29 @@ fn rebind_max_per_session() -> u32 {
             .and_then(|s| s.parse().ok())
             .unwrap_or(REBIND_MAX_PER_SESSION_DEFAULT)
     })
+}
+
+fn rebind_rescue_gap_tokens() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_RESCUE_GAP_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_RESCUE_GAP_TOKENS_DEFAULT)
+    })
+}
+
+/// The min-new-tokens gate blocks a turn only when the backlog gap is also
+/// below the rescue threshold; a gap past it justifies the move on the
+/// session's own queue-wait alone.
+fn min_new_tokens_gate_blocks(
+    request_new_tokens: usize,
+    min_new_tokens: usize,
+    gap: usize,
+    rescue_gap: usize,
+) -> bool {
+    request_new_tokens < min_new_tokens && gap <= rescue_gap
 }
 
 fn rebind_hysteresis_tokens() -> usize {
@@ -703,7 +731,12 @@ impl KvPushRouter {
         let route_outcome = cancel_on_stop(
             request_context.as_ref(),
             &context_id,
-            self.sticky.on_routed(&request, worker, &context_id),
+            self.sticky.on_routed_rebind_aware(
+                &request,
+                worker,
+                &context_id,
+                pending_rebind.is_some(),
+            ),
         )
         .await
         .and_then(|result| result);
@@ -987,9 +1020,21 @@ impl KvPushRouter {
             session_history,
             "Layer-2 diag: raw backlog gap before trigger gates"
         );
-        // Greedy load-shedding: small turns keep locality on the hot rank.
-        if request_new_tokens < min_new_tokens {
+        // Greedy load-shedding: small turns keep locality on the hot rank —
+        // unless the backlog gap is past the rescue threshold, where escaping
+        // the queue dominates any locality argument (rescue path).
+        let rescue_gap = rebind_rescue_gap_tokens();
+        if min_new_tokens_gate_blocks(request_new_tokens, min_new_tokens, gap, rescue_gap) {
             return None;
+        }
+        if request_new_tokens < min_new_tokens {
+            tracing::info!(
+                %session_id,
+                gap,
+                rescue_gap,
+                request_new_tokens,
+                "Layer-2 rescue path: large backlog waives the min-new-tokens gate"
+            );
         }
         if gap <= hysteresis {
             return None;
@@ -1466,6 +1511,9 @@ mod tests {
             // Disable the post-rollback cooldown in tests so rapid rebinds
             // fire without waiting 120 s.
             std::env::set_var("DYN_REBIND_COOLDOWN_SECS", "0");
+            // Rescue path is exercised via the pure-function test; keep the
+            // e2e trigger tests on the plain min-new-tokens path.
+            std::env::set_var("DYN_REBIND_RESCUE_GAP_TOKENS", "1000000");
         }
     }
 
@@ -1729,6 +1777,70 @@ mod tests {
         let action = gate.observe(&prefill_complete_marker());
         assert!(matches!(action, RebindStreamAction::ReplaceWithError(_)));
         assert_eq!(visible_affinity(&router, session_id), Some(concurrent));
+        assert!(gate.finish().is_none());
+    }
+
+    /// The rebound turn itself carries action=Bind toward the cold target; the
+    /// dispatch path must suppress that put so the turn's own routing does not
+    /// destroy its shadow (the production 100%-rollback root cause).
+    #[tokio::test]
+    async fn rebound_turn_suppressed_bind_allows_commit() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "rebound-turn-self-bind";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+
+        let rebound_turn_bind = session_request(session_id, Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed_rebind_aware(&rebound_turn_bind, cold, "rebound-turn", true)
+            .await
+            .unwrap();
+        // Suppressed: the visible binding is still hot, shadow intact.
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+
+        assert_eq!(
+            gate.observe(&prefill_bootstrap_output()),
+            RebindStreamAction::Forward
+        );
+        assert_eq!(
+            gate.observe(&prefill_complete_marker()),
+            RebindStreamAction::Committed
+        );
+        assert_eq!(visible_affinity(&router, session_id), Some(cold));
+        assert!(gate.finish().is_none());
+    }
+
+    /// A same-target Bind from an overlapping sibling turn is an idempotent
+    /// TTL refresh and must not invalidate the pending shadow; only a genuine
+    /// target change may fail the commit CAS.
+    #[tokio::test]
+    async fn concurrent_same_target_bind_keeps_shadow_alive() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "concurrent-same-target-bind";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+        assert_eq!(
+            gate.observe(&prefill_bootstrap_output()),
+            RebindStreamAction::Forward
+        );
+
+        // Sibling turn resolves the visible (hot) binding and re-binds it.
+        let sibling_bind = session_request(session_id, Some(SessionAction::Bind), 1);
+        router
+            .sticky
+            .on_routed(&sibling_bind, hot, "sibling-bind")
+            .await
+            .unwrap();
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+
+        assert_eq!(
+            gate.observe(&prefill_complete_marker()),
+            RebindStreamAction::Committed
+        );
+        assert_eq!(visible_affinity(&router, session_id), Some(cold));
         assert!(gate.finish().is_none());
     }
 
@@ -2151,6 +2263,23 @@ mod tests {
         assert!(!session_history_exceeds_migration_cap(100_000, 100_000, 262_144));
         // Delta larger than ISL (dest-side estimate drift) must not underflow.
         assert!(!session_history_exceeds_migration_cap(1_000, 2_000, 262_144));
+    }
+
+    // Rescue path (same pure-function situation as the cap gate above): a
+    // small turn is normally kept local, but a backlog gap past the rescue
+    // threshold waives the min-new-tokens gate.
+    #[test]
+    fn min_new_tokens_gate_rescue_boundaries() {
+        // v4 audit case: 1087-token turn stuck behind a 517k backlog — the
+        // plain gate would block it; the rescue threshold must let it through.
+        assert!(!min_new_tokens_gate_blocks(1_087, 4_096, 517_477, 131_072));
+        // Small turn, modest gap: blocked (locality wins).
+        assert!(min_new_tokens_gate_blocks(1_087, 4_096, 88_635, 131_072));
+        // Exactly at the rescue threshold still blocks (strict-greater).
+        assert!(min_new_tokens_gate_blocks(1_087, 4_096, 131_072, 131_072));
+        assert!(!min_new_tokens_gate_blocks(1_087, 4_096, 131_073, 131_072));
+        // Turns that clear min-new-tokens never consult the rescue threshold.
+        assert!(!min_new_tokens_gate_blocks(4_096, 4_096, 0, 131_072));
     }
 
     #[tokio::test]
