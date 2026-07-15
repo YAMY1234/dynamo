@@ -69,6 +69,10 @@ const REBIND_MAX_MIGRATION_TOKENS_DEFAULT: usize = 262144;
 // large is worth moving for its own latency regardless — its wait ∝ gap, not
 // ∝ new tokens, while the migration transfer runs ~10x faster than recompute.
 const REBIND_RESCUE_GAP_TOKENS_DEFAULT: usize = 131072;
+// Floor on the estimated migratable history: moving a session whose source
+// holds almost nothing wins little (small transfer) and risks a full cold
+// re-prefill when the estimate is stale. 0 disables the gate.
+const REBIND_MIN_HISTORY_TOKENS_DEFAULT: usize = 0;
 
 fn rebind_min_new_tokens() -> usize {
     use std::sync::OnceLock;
@@ -89,6 +93,17 @@ fn rebind_max_per_session() -> u32 {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(REBIND_MAX_PER_SESSION_DEFAULT)
+    })
+}
+
+fn rebind_min_history_tokens() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_MIN_HISTORY_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_MIN_HISTORY_TOKENS_DEFAULT)
     })
 }
 
@@ -1037,6 +1052,19 @@ impl KvPushRouter {
             );
         }
         if gap <= hysteresis {
+            return None;
+        }
+        // Low-value gamble floor: a tiny estimated history means a tiny win
+        // when the transfer succeeds and a full cold re-prefill when the
+        // estimate is stale — skip unless there is real KV to move.
+        let min_history = rebind_min_history_tokens();
+        if min_history > 0 && session_history < min_history {
+            tracing::info!(
+                %session_id,
+                session_history,
+                min_history,
+                "Layer-2 rebind skipped: estimated history below the migration value floor"
+            );
             return None;
         }
         // The migration layer refuses transfers above its token cap
