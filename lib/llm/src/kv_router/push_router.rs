@@ -96,6 +96,19 @@ fn rebind_max_per_session() -> u32 {
     })
 }
 
+/// One-turn rescue: serve the rebound turn on the cold rank (with its
+/// migrated KV) but do NOT publish the binding — the session's next turns
+/// return to their home rank. Kills the post-move tax when cold-rank
+/// advantages are transient (saturation), at the cost of re-transferring on a
+/// later rescue (rate-limited by the post-rollback cooldown).
+fn rebind_one_turn() -> bool {
+    // Read per call (rebinds are rare): tests toggle this around a single ACK,
+    // which a OnceLock would freeze at first use.
+    std::env::var("DYN_REBIND_ONE_TURN")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn rebind_min_history_tokens() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
@@ -323,6 +336,14 @@ impl RebindResponseGate {
                 .pending
                 .take()
                 .expect("pending rebind must exist while processing its ACK");
+            if rebind_one_turn() {
+                // Guard drop rolls the shadow back: the turn was served cold
+                // with its migrated KV, the binding stays home, and the
+                // rollback arms the per-session cooldown as a rate limit.
+                drop(rebind);
+                self.record(RebindTransition::OneTurnReleased);
+                return RebindStreamAction::Committed;
+            }
             return if rebind.commit() {
                 self.record(RebindTransition::CommitPrefillCompleteAck);
                 RebindStreamAction::Committed
@@ -1837,6 +1858,36 @@ mod tests {
             RebindStreamAction::Committed
         );
         assert_eq!(visible_affinity(&router, session_id), Some(cold));
+        assert!(gate.finish().is_none());
+    }
+
+    /// One-turn rescue: the ACK must release the shadow without publishing —
+    /// the served turn ran cold with migrated KV, but the session's next turns
+    /// go home. The rollback arms the cooldown as the re-rescue rate limit.
+    #[tokio::test]
+    async fn one_turn_ack_keeps_home_binding_and_arms_cooldown() {
+        let router = make_dp_test_router().await;
+        let hot = WorkerWithDpRank::new(42, 0);
+        let cold = WorkerWithDpRank::new(42, 1);
+        let session_id = "one-turn-session";
+        let mut gate = make_rebind_response_gate(&router, session_id, hot, cold).await;
+        assert_eq!(
+            gate.observe(&prefill_bootstrap_output()),
+            RebindStreamAction::Forward
+        );
+
+        unsafe { std::env::set_var("DYN_REBIND_ONE_TURN", "1") };
+        let action = gate.observe(&prefill_complete_marker());
+        unsafe { std::env::remove_var("DYN_REBIND_ONE_TURN") };
+
+        assert_eq!(action, RebindStreamAction::Committed);
+        assert_eq!(visible_affinity(&router, session_id), Some(hot));
+        assert!(
+            router
+                .sticky
+                .in_rebind_cooldown(session_id, Duration::from_secs(60)),
+            "rollback must arm the per-session cooldown"
+        );
         assert!(gate.finish().is_none());
     }
 

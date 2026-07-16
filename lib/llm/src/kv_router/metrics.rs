@@ -592,6 +592,7 @@ const REBIND_TRANSITIONS_TOTAL: &str = "rebind_transitions_total";
 pub(crate) enum RebindTransition {
     DecisionLoadImbalance,
     CommitPrefillCompleteAck,
+    OneTurnReleased,
     AbortTrackingError,
     AbortPrepareError,
     AbortRouteError,
@@ -611,6 +612,7 @@ impl RebindTransition {
         match self {
             Self::DecisionLoadImbalance => ("decision", "load_imbalance"),
             Self::CommitPrefillCompleteAck => ("commit", "prefill_complete_ack"),
+            Self::OneTurnReleased => ("one_turn", "prefill_complete_ack"),
             Self::AbortTrackingError => ("abort", "tracking_error"),
             Self::AbortPrepareError => ("abort", "prepare_error"),
             Self::AbortRouteError => ("abort", "route_error"),
