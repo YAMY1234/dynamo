@@ -143,6 +143,101 @@ fn min_new_tokens_gate_blocks(
     request_new_tokens < min_new_tokens && gap <= rescue_gap
 }
 
+// Engine-truth trigger (v10): measured against engine logs at c32, the
+// router's backlog estimate mis-fired on ranks with no real queue (5% of
+// fires) and missed 57% of real >100k-token gaps entirely. When the worker
+// publishes per-rank scheduler queue depth (num_requests_waiting), use it to
+// veto phantom fires and to fire on engine-confirmed backlog the estimate
+// cannot see. Queue depth is in requests, not tokens: it confirms *that* the
+// hot rank is backlogged, while the token estimate still sizes the move.
+const REBIND_ENGINE_HOT_MIN_WAITING_DEFAULT: u64 = 2;
+const REBIND_ENGINE_COLD_MAX_WAITING_DEFAULT: u64 = 0;
+
+fn rebind_engine_truth() -> bool {
+    // Read per call (rebind checks are rare); mirrors rebind_one_turn so tests
+    // can toggle without fighting a OnceLock.
+    std::env::var("DYN_REBIND_ENGINE_TRUTH")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn rebind_engine_hot_min_waiting() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_ENGINE_HOT_MIN_WAITING")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_ENGINE_HOT_MIN_WAITING_DEFAULT)
+    })
+}
+
+fn rebind_engine_cold_max_waiting() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DYN_REBIND_ENGINE_COLD_MAX_WAITING")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(REBIND_ENGINE_COLD_MAX_WAITING_DEFAULT)
+    })
+}
+
+/// Which signal justified a rebind fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebindTrigger {
+    /// No fire: neither the estimate nor engine truth shows an actionable gap.
+    None,
+    /// The backlog estimate fired and engine truth (when present) does not
+    /// contradict it.
+    Estimate,
+    /// The estimate saw no actionable gap but the engine reports a queued hot
+    /// rank and an idle cold rank — the measured missed-opportunity case.
+    EngineTruth,
+}
+
+/// Resolve the trigger from the estimate verdict and engine truth.
+///
+/// Truth is only consulted when enabled AND the hot rank has published the
+/// metric (`hot_waiting` is `Some`); otherwise behavior is estimate-only.
+/// With truth in hand:
+/// - an estimate fire with `hot_waiting == 0` is a phantom (stale estimate) — veto;
+/// - an estimate fire whose cold target reports waiting above the cold
+///   ceiling would land the session in another queue — veto;
+/// - without an estimate fire, `hot_waiting >= hot_min` plus a published
+///   `cold_waiting <= cold_max` fires: the queue depth is direct evidence of
+///   the wait the session dodges (an unpublished cold rank is unknown, not
+///   idle — no fire).
+fn resolve_rebind_trigger(
+    estimate_fires: bool,
+    truth_enabled: bool,
+    hot_waiting: Option<u64>,
+    cold_waiting: Option<u64>,
+    hot_min_waiting: u64,
+    cold_max_waiting: u64,
+) -> RebindTrigger {
+    let Some(hot) = hot_waiting.filter(|_| truth_enabled) else {
+        return if estimate_fires {
+            RebindTrigger::Estimate
+        } else {
+            RebindTrigger::None
+        };
+    };
+    if estimate_fires {
+        if hot == 0 {
+            return RebindTrigger::None;
+        }
+        if cold_waiting.is_some_and(|c| c > cold_max_waiting) {
+            return RebindTrigger::None;
+        }
+        return RebindTrigger::Estimate;
+    }
+    if hot >= hot_min_waiting && cold_waiting.is_some_and(|c| c <= cold_max_waiting) {
+        return RebindTrigger::EngineTruth;
+    }
+    RebindTrigger::None
+}
+
 fn rebind_hysteresis_tokens() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
@@ -417,12 +512,17 @@ pub struct KvPushRouter {
     pub chooser: Arc<KvRouter>,
     /// Sticky session routing. Lazily activated when requests carry session_control.
     pub(super) sticky: Arc<StickySessionCoordinator>,
+    /// Engine-truth load source for the rebind trigger (per-rank queue depth
+    /// published by workers over kv_metrics). None when this WorkerSet has no
+    /// monitor; the trigger then runs estimate-only.
+    worker_monitor: Option<crate::discovery::KvWorkerMonitor>,
 }
 
 impl KvPushRouter {
     pub fn new(
         inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
         chooser: Arc<KvRouter>,
+        worker_monitor: Option<crate::discovery::KvWorkerMonitor>,
     ) -> Self {
         // Eagerly register router request metrics (as zeros) so they are
         // scrapeable before any requests arrive. Both the frontend pipeline
@@ -449,7 +549,16 @@ impl KvPushRouter {
             inner,
             chooser,
             sticky,
+            worker_monitor,
         }
+    }
+
+    /// Engine-reported queue depth for one (worker, dp_rank); None when no
+    /// monitor is attached or that rank has never published the metric.
+    fn engine_waiting(&self, worker_id: u64, dp_rank: u32) -> Option<u64> {
+        self.worker_monitor
+            .as_ref()?
+            .num_requests_waiting(worker_id, dp_rank)
     }
 
     fn record_rebind_transition(&self, transition: RebindTransition) {
@@ -1060,10 +1169,47 @@ impl KvPushRouter {
         // unless the backlog gap is past the rescue threshold, where escaping
         // the queue dominates any locality argument (rescue path).
         let rescue_gap = rebind_rescue_gap_tokens();
-        if min_new_tokens_gate_blocks(request_new_tokens, min_new_tokens, gap, rescue_gap) {
+        let estimate_fires = !min_new_tokens_gate_blocks(
+            request_new_tokens,
+            min_new_tokens,
+            gap,
+            rescue_gap,
+        ) && gap > hysteresis;
+        // Engine truth: per-rank queue depth published by the worker, when
+        // available. Confirms estimate fires and captures gaps the estimate
+        // missed; absent metric falls back to estimate-only behavior.
+        let truth_enabled = rebind_engine_truth();
+        let (hot_waiting, cold_waiting) = if truth_enabled {
+            (
+                self.engine_waiting(hot.worker_id, hot.dp_rank),
+                self.engine_waiting(cold.worker_id, cold.dp_rank),
+            )
+        } else {
+            (None, None)
+        };
+        let trigger = resolve_rebind_trigger(
+            estimate_fires,
+            truth_enabled,
+            hot_waiting,
+            cold_waiting,
+            rebind_engine_hot_min_waiting(),
+            rebind_engine_cold_max_waiting(),
+        );
+        // DIAG: one line per trigger resolution so post-run forensics can
+        // count estimate-vs-truth fires and vetoes from the frontend log.
+        tracing::info!(
+            %session_id,
+            estimate_fires,
+            truth_enabled,
+            ?hot_waiting,
+            ?cold_waiting,
+            ?trigger,
+            "Layer-2 diag: trigger resolution (estimate vs engine truth)"
+        );
+        if trigger == RebindTrigger::None {
             return None;
         }
-        if request_new_tokens < min_new_tokens {
+        if estimate_fires && request_new_tokens < min_new_tokens {
             tracing::info!(
                 %session_id,
                 gap,
@@ -1071,9 +1217,6 @@ impl KvPushRouter {
                 request_new_tokens,
                 "Layer-2 rescue path: large backlog waives the min-new-tokens gate"
             );
-        }
-        if gap <= hysteresis {
-            return None;
         }
         // Low-value gamble floor: a tiny estimated history means a tiny win
         // when the transfer succeeds and a full cold re-prefill when the
@@ -1655,7 +1798,7 @@ mod tests {
         let inner = PushRouter::from_client(client, RouterMode::KV)
             .await
             .unwrap();
-        KvPushRouter::new(inner, chooser)
+        KvPushRouter::new(inner, chooser, None)
     }
 
     async fn make_dp_test_router_with_workers(worker_ids: &[u64]) -> KvPushRouter {
@@ -2359,6 +2502,42 @@ mod tests {
         assert!(!min_new_tokens_gate_blocks(1_087, 4_096, 131_073, 131_072));
         // Turns that clear min-new-tokens never consult the rescue threshold.
         assert!(!min_new_tokens_gate_blocks(4_096, 4_096, 0, 131_072));
+    }
+
+    // Engine-truth trigger resolution (v10). Guards the measured c32 failure
+    // modes: phantom estimate fires on ranks with no real queue, and real
+    // engine backlogs the estimate never saw. Pure function, exact contract.
+    #[test]
+    fn engine_truth_trigger_resolution() {
+        let resolve = |est: bool, truth: bool, hot: Option<u64>, cold: Option<u64>| {
+            resolve_rebind_trigger(est, truth, hot, cold, 2, 0)
+        };
+
+        // Truth disabled or hot rank never published: estimate-only behavior.
+        assert_eq!(resolve(true, false, Some(0), Some(0)), RebindTrigger::Estimate);
+        assert_eq!(resolve(false, false, Some(9), Some(0)), RebindTrigger::None);
+        assert_eq!(resolve(true, true, None, Some(0)), RebindTrigger::Estimate);
+        assert_eq!(resolve(false, true, None, Some(0)), RebindTrigger::None);
+
+        // Veto: estimate fire against an engine-idle hot rank is a phantom.
+        assert_eq!(resolve(true, true, Some(0), Some(0)), RebindTrigger::None);
+        // Veto: cold target has its own engine queue — don't trade queues.
+        assert_eq!(resolve(true, true, Some(5), Some(1)), RebindTrigger::None);
+        // Confirmed estimate fire: real hot queue, idle cold.
+        assert_eq!(resolve(true, true, Some(1), Some(0)), RebindTrigger::Estimate);
+        // Unpublished cold does not veto a confirmed estimate fire (the
+        // estimate already ranked it coldest).
+        assert_eq!(resolve(true, true, Some(1), None), RebindTrigger::Estimate);
+
+        // Truth fire: no estimate gap, but engine shows hot backlog >= min
+        // and a published idle cold rank.
+        assert_eq!(resolve(false, true, Some(2), Some(0)), RebindTrigger::EngineTruth);
+        // Below the hot floor: a 1-deep queue is not evidence enough.
+        assert_eq!(resolve(false, true, Some(1), Some(0)), RebindTrigger::None);
+        // Unpublished cold is unknown, not idle — no truth fire.
+        assert_eq!(resolve(false, true, Some(2), None), RebindTrigger::None);
+        // Cold with queue depth above the ceiling: no truth fire.
+        assert_eq!(resolve(false, true, Some(2), Some(1)), RebindTrigger::None);
     }
 
     #[tokio::test]

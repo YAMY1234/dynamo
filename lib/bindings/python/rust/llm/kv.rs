@@ -695,15 +695,22 @@ impl WorkerMetricsPublisher {
     /// * `dp_rank` - Data parallel rank of the worker (None defaults to 0)
     /// * `active_decode_blocks` - Scheduler-compatible active decode block count
     /// * `kv_used_blocks` - Authoritative total KV blocks currently in use
-    #[pyo3(signature = (dp_rank=None, active_decode_blocks=None, kv_used_blocks=None))]
+    /// * `num_requests_waiting` - Engine scheduler queue depth for this dp_rank
+    #[pyo3(signature = (dp_rank=None, active_decode_blocks=None, kv_used_blocks=None, num_requests_waiting=None))]
     fn publish(
         &self,
         dp_rank: Option<u32>,
         active_decode_blocks: Option<u64>,
         kv_used_blocks: Option<u64>,
+        num_requests_waiting: Option<u64>,
     ) -> PyResult<()> {
         self.inner
-            .publish(dp_rank, active_decode_blocks, kv_used_blocks)
+            .publish(
+                dp_rank,
+                active_decode_blocks,
+                kv_used_blocks,
+                num_requests_waiting,
+            )
             .map_err(to_pyerr)
     }
 }
@@ -1487,7 +1494,7 @@ impl KvRouter {
             )
             .await?;
 
-            let kv_push_router = RsKvPushRouter::new(push_router, kv_router);
+            let kv_push_router = RsKvPushRouter::new(push_router, kv_router, None);
 
             Ok(Self {
                 inner: Arc::new(kv_push_router),

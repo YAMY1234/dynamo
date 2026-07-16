@@ -181,6 +181,8 @@ pub struct WorkerLoadState {
     pub kv_used_blocks: HashMap<u32, u64>,
     pub kv_total_blocks: HashMap<u32, u64>,
     pub active_prefill_tokens: HashMap<u32, u64>,
+    /// Engine-reported scheduler queue depth (waiting requests) per dp_rank.
+    pub num_requests_waiting: HashMap<u32, u64>,
     /// max_num_batched_tokens from runtime config (same for all dp_ranks)
     pub max_num_batched_tokens: HashMap<u32, u64>,
     decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
@@ -283,6 +285,9 @@ impl WorkerLoadState {
         }
         if let Some(active_tokens) = active_load.active_prefill_tokens {
             self.active_prefill_tokens.insert(dp_rank, active_tokens);
+        }
+        if let Some(waiting) = active_load.num_requests_waiting {
+            self.num_requests_waiting.insert(dp_rank, waiting);
         }
         if let Some(threshold) = active_decode_blocks_threshold {
             self.update_decode_overload_latch(
@@ -530,6 +535,19 @@ impl KvWorkerMonitor {
         tracing::debug!(
             "KvWorkerMonitor: prefill client attached (seeded overloaded set; overload publish + TTFT cleanup)"
         );
+    }
+
+    /// Engine-reported scheduler queue depth for one (worker, dp_rank).
+    ///
+    /// `None` means that rank has never published the metric (stream absent or
+    /// engine metrics disabled); callers must fall back to their own estimate
+    /// rather than treating it as an idle rank.
+    pub fn num_requests_waiting(&self, worker_id: u64, dp_rank: u32) -> Option<u64> {
+        self.worker_load_states
+            .get(&worker_id)?
+            .num_requests_waiting
+            .get(&dp_rank)
+            .copied()
     }
 
     /// Get the current active decode blocks threshold, if configured.
@@ -1099,6 +1117,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1118,6 +1137,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1130,6 +1150,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1142,6 +1163,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1160,6 +1182,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1172,6 +1195,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1190,6 +1214,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1202,6 +1227,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1220,6 +1246,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1232,6 +1259,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1270,6 +1298,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );
@@ -1288,6 +1317,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_requests_waiting: None,
             },
             Some(0.6),
         );

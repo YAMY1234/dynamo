@@ -158,7 +158,11 @@ impl PrefillRouter {
             .await?;
 
             // Wrap it in KvPushRouter
-            InnerPrefillRouter::KvRouter(Arc::new(KvPushRouter::new(push_router, kv_chooser)))
+            InnerPrefillRouter::KvRouter(Arc::new(KvPushRouter::new(
+                push_router,
+                kv_chooser,
+                worker_monitor.cloned(),
+            )))
         } else {
             // Create client for simple router
             let client = endpoint.client().await?;

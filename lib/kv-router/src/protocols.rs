@@ -572,6 +572,12 @@ pub struct ActiveLoad {
     /// backend KV occupancy used by overload detection.
     #[serde(default)]
     pub kv_used_blocks: Option<u64>,
+    /// Engine-reported scheduler queue depth (requests waiting, not yet
+    /// scheduled) for this dp_rank. Worker-published ground truth for the
+    /// Layer-2 rebind trigger, which otherwise relies on the router's own
+    /// backlog estimate.
+    #[serde(default)]
+    pub num_requests_waiting: Option<u64>,
 }
 
 /// A [`LocalBlockHash`] is a hash computed from the token IDs, optional multimodal metadata,

@@ -116,6 +116,7 @@ fn preprocessed_backend_engine(
     router: LlmPushRouter,
     router_mode: RouterMode,
     chooser: Option<Arc<KvRouter>>,
+    worker_monitor: Option<KvWorkerMonitor>,
 ) -> anyhow::Result<ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>>
 {
     let engine: ServiceEngine<_, _> = match router_mode {
@@ -129,7 +130,7 @@ fn preprocessed_backend_engine(
             let Some(chooser) = chooser else {
                 anyhow::bail!("RouterMode::KV requires KVRouter to not be null");
             };
-            Arc::new(KvPushRouter::new(router, chooser))
+            Arc::new(KvPushRouter::new(router, chooser, worker_monitor))
         }
     };
 
@@ -151,6 +152,9 @@ pub async fn build_preprocessed_routing(
 
     wait_for_min_initial_workers(&router_client, min_initial_workers).await?;
 
+    // Keep a concrete handle for the KvPushRouter's engine-truth reads; the
+    // dyn-erased Arc below only exposes the start_monitoring surface.
+    let monitor_for_rebind = worker_monitor.clone();
     let monitor_arc =
         worker_monitor.map(|m| Arc::new(m) as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>);
 
@@ -166,7 +170,8 @@ pub async fn build_preprocessed_routing(
     let prefill_router = prefill_chooser
         .unwrap_or_else(|| PrefillRouter::disabled(model_manager, router_mode, enforce_disagg));
 
-    let backend_engine = preprocessed_backend_engine(router, router_mode, chooser)?;
+    let backend_engine =
+        preprocessed_backend_engine(router, router_mode, chooser, monitor_for_rebind)?;
 
     Ok(PreprocessedRouting {
         backend_engine,
