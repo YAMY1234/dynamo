@@ -172,6 +172,14 @@ class DynamoSglangPublisher:
 
         # Set default values (can be overridden later if needed)
         self.dp_rank = 0
+        self._logical_decode_worker = (
+            getattr(self.server_args, "disaggregation_mode", None) == "decode"
+            and getattr(self.dynamo_args, "decode_dp_rank_source", "router")
+            == "engine"
+        )
+        self._logical_dp_size = getattr(self.server_args, "dp_size", 1) or 1
+        self._logical_block_values: dict[int, tuple[int, int]] = {}
+        self._logical_dirty_ranks: set[int] = set()
 
         self._running = True
         self.kv_publishers: List[KvEventPublisher] = []
@@ -217,29 +225,53 @@ class DynamoSglangPublisher:
                 # Receive KvMetrics object from SGLang scheduler via ZMQ
                 # KvMetrics class: sglang/srt/observability/scheduler_metrics_mixin.py
                 kv_metrics = await self._sock.recv_pyobj()
-                dp_rank = (
-                    kv_metrics.data_parallel_rank
-                    if kv_metrics.data_parallel_rank is not None
-                    else self.dp_rank
-                )
-                active_decode_blocks, total_blocks = kv_metrics_block_values(
-                    kv_metrics, self.server_args.page_size
-                )
-                self.metrics_publisher.publish(
-                    dp_rank, kv_used_blocks=active_decode_blocks
-                )
-                dp_rank_str = str(dp_rank)
-                # Publish total blocks (always available in KvMetrics)
-                self.component_gauges.set_total_blocks(dp_rank_str, total_blocks)
-                # Publish GPU cache usage percentage (always available in KvMetrics)
-                self.component_gauges.set_gpu_cache_usage(
-                    dp_rank_str, kv_metrics.gpu_cache_usage_perc
-                )
+                self._publish_scheduler_metrics(kv_metrics)
             except Exception:
                 if self._running:
                     logging.exception(
                         "Failed to receive or publish SGLang scheduler metrics"
                     )
+
+    def _publish_scheduler_metrics(self, kv_metrics) -> None:
+        dp_rank = (
+            kv_metrics.data_parallel_rank
+            if kv_metrics.data_parallel_rank is not None
+            else self.dp_rank
+        )
+        active_decode_blocks, total_blocks = kv_metrics_block_values(
+            kv_metrics, self.server_args.page_size
+        )
+        gpu_cache_usage = kv_metrics.gpu_cache_usage_perc
+
+        if self._logical_decode_worker:
+            if not 0 <= dp_rank < self._logical_dp_size:
+                raise ValueError(
+                    f"Invalid local DP rank {dp_rank}; expected "
+                    f"[0, {self._logical_dp_size})"
+                )
+            self._logical_block_values[dp_rank] = (
+                active_decode_blocks,
+                total_blocks,
+            )
+            self._logical_dirty_ranks.add(dp_rank)
+            if len(self._logical_dirty_ranks) < self._logical_dp_size:
+                return
+            self._logical_dirty_ranks.clear()
+            dp_rank = 0
+            active_decode_blocks = sum(
+                values[0] for values in self._logical_block_values.values()
+            )
+            total_blocks = sum(
+                values[1] for values in self._logical_block_values.values()
+            )
+            gpu_cache_usage = (
+                active_decode_blocks / total_blocks if total_blocks else 0.0
+            )
+
+        self.metrics_publisher.publish(dp_rank, kv_used_blocks=active_decode_blocks)
+        dp_rank_str = str(dp_rank)
+        self.component_gauges.set_total_blocks(dp_rank_str, total_blocks)
+        self.component_gauges.set_gpu_cache_usage(dp_rank_str, gpu_cache_usage)
 
     def cleanup(self) -> None:
         """Clean up ZMQ resources."""

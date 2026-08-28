@@ -12,6 +12,7 @@ from dynamo.sglang.capacity import (
     local_dp_rank_bounds,
     model_card_dp_rank_bounds,
     publishes_kv_events,
+    runtime_capacity,
 )
 
 pytestmark = [
@@ -37,6 +38,29 @@ def test_model_card_registration_keeps_global_dp_range():
 
     assert model_card_dp_rank_bounds(server_args) == (0, 16)
     assert model_card_dp_rank_bounds(server_args, "engine") == (0, 1)
+
+
+def test_engine_rank_source_aggregates_logical_worker_capacity():
+    server_args = SimpleNamespace(
+        dp_size=4,
+        enable_dp_attention=True,
+        nnodes=1,
+        node_rank=0,
+        max_running_requests=320,
+        max_prefill_tokens=16384,
+        page_size=64,
+    )
+    scheduler_info = {"max_total_num_tokens": 6400}
+
+    per_rank = runtime_capacity(server_args, scheduler_info)
+    logical_worker = runtime_capacity(server_args, scheduler_info, "engine")
+
+    assert per_rank.total_kv_blocks == 100
+    assert per_rank.max_num_seqs == 80
+    assert per_rank.max_num_batched_tokens == 16384
+    assert logical_worker.total_kv_blocks == 400
+    assert logical_worker.max_num_seqs == 320
+    assert logical_worker.max_num_batched_tokens == 65536
 
 
 def _args(**kwargs) -> SimpleNamespace:

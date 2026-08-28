@@ -378,9 +378,11 @@ async def _get_runtime_config(
     )
     runtime_config.kv_event_publishing_enabled = dynamo_args.use_kv_events
 
+    decode_dp_rank_source = (
+        dynamo_args.decode_dp_rank_source if is_decode_worker else "router"
+    )
     start_dp_rank, end_dp_rank = model_card_dp_rank_bounds(
-        server_args,
-        dynamo_args.decode_dp_rank_source if is_decode_worker else "router",
+        server_args, decode_dp_rank_source
     )
     registered_dp_size = end_dp_rank - start_dp_rank
     runtime_config.data_parallel_start_rank = start_dp_rank
@@ -423,7 +425,7 @@ async def _get_runtime_config(
     # In SGLang, these are server_args, not scheduler_info (unlike vLLM)
     # Note: If --max-running-requests is not specified, SGLang uses an internal default
     # undocumented value. The value here will be None if not explicitly set by user.
-    base_capacity = runtime_capacity(server_args, {})
+    base_capacity = runtime_capacity(server_args, {}, decode_dp_rank_source)
     if base_capacity.max_num_seqs is not None:
         runtime_config.max_num_seqs = base_capacity.max_num_seqs
     if base_capacity.max_num_batched_tokens is not None:
@@ -463,7 +465,9 @@ async def _get_runtime_config(
 
     try:
         scheduler_info = engine._scheduler_init_result.scheduler_infos[0]
-        capacity = runtime_capacity(server_args, scheduler_info)
+        capacity = runtime_capacity(
+            server_args, scheduler_info, decode_dp_rank_source
+        )
         max_total_tokens = scheduler_info.get("max_total_num_tokens")
 
         if max_total_tokens:

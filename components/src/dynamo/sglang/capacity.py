@@ -94,23 +94,33 @@ def tokens_to_kv_blocks(tokens: int, page_size: int | None) -> int:
 
 
 def runtime_capacity(
-    server_args: Any, scheduler_info: dict[str, Any]
+    server_args: Any,
+    scheduler_info: dict[str, Any],
+    decode_dp_rank_source: str = "router",
 ) -> RuntimeCapacity:
     max_total_tokens = scheduler_info.get("max_total_num_tokens")
     page_size = getattr(server_args, "page_size", None)
+    dp_size = getattr(server_args, "dp_size", 1) or 1
+    logical_worker_size = dp_size if decode_dp_rank_source == "engine" else 1
     total_kv_blocks = (
-        tokens_to_kv_blocks(max_total_tokens, page_size)
+        tokens_to_kv_blocks(max_total_tokens, page_size) * logical_worker_size
         if max_total_tokens and page_size
         else None
     )
+    max_num_seqs = getattr(server_args, "max_running_requests", None)
+    if max_num_seqs is not None and decode_dp_rank_source != "engine":
+        max_num_seqs = per_rank_max_running_requests(server_args)
+    max_num_batched_tokens = (
+        getattr(server_args, "max_prefill_tokens", None) or max_total_tokens
+    )
+    if max_num_batched_tokens is not None:
+        max_num_batched_tokens *= logical_worker_size
 
     dp_start, dp_end = local_dp_rank_bounds(server_args)
     return RuntimeCapacity(
         total_kv_blocks=total_kv_blocks,
-        max_num_seqs=per_rank_max_running_requests(server_args),
-        max_num_batched_tokens=(
-            getattr(server_args, "max_prefill_tokens", None) or max_total_tokens
-        ),
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
         data_parallel_start_rank=dp_start,
         data_parallel_size=dp_end - dp_start,
     )

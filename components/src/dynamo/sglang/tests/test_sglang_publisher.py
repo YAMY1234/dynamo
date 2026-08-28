@@ -561,6 +561,50 @@ def test_init_kv_event_publish_allows_zero_worker_id_override(monkeypatch):
     publisher.cleanup()
 
 
+def test_logical_decode_worker_aggregates_scheduler_metrics(monkeypatch):
+    monkeypatch.setattr(
+        publisher_mod,
+        "get_zmq_socket",
+        lambda *args, **kwargs: SimpleNamespace(close=lambda linger=0: None),
+    )
+    component_gauges = Mock()
+    config = SimpleNamespace(
+        server_args=SimpleNamespace(
+            disaggregation_mode="decode",
+            dp_size=4,
+            node_rank=0,
+            page_size=1,
+        ),
+        dynamo_args=SimpleNamespace(decode_dp_rank_source="engine"),
+    )
+    publisher = DynamoSglangPublisher(
+        engine=SimpleNamespace(
+            port_args=SimpleNamespace(metrics_ipc_name="ipc://metrics")
+        ),
+        config=config,
+        generate_endpoint=SimpleNamespace(),
+        component_gauges=component_gauges,
+    )
+    publisher.metrics_publisher = Mock()
+
+    for rank, active_blocks in enumerate((10, 20, 30, 40)):
+        publisher._publish_scheduler_metrics(
+            SimpleNamespace(
+                data_parallel_rank=rank,
+                gpu_cache_usage_perc=active_blocks / 100,
+                kv_active_blocks=active_blocks,
+                kv_total_blocks=100,
+            )
+        )
+
+    publisher.metrics_publisher.publish.assert_called_once_with(
+        0, kv_used_blocks=100
+    )
+    component_gauges.set_total_blocks.assert_called_once_with("0", 400)
+    component_gauges.set_gpu_cache_usage.assert_called_once_with("0", 0.25)
+    publisher.cleanup()
+
+
 # ---- per-worker metric gating (embedding vs chat) ----
 
 
