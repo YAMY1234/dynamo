@@ -241,6 +241,18 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             return None
         return routing.get("dp_rank")
 
+    def _resolve_engine_session_id(self, request: Dict[str, Any]) -> Optional[str]:
+        if (
+            self._decode_dp_rank_source != "engine"
+            or self.config.server_args.load_balance_method != "conversation_affinity"
+        ):
+            return None
+        session_id = (request.get("agent_context") or {}).get("session_id")
+        if not isinstance(session_id, str):
+            return None
+        session_id = session_id.strip()
+        return session_id or None
+
     @staticmethod
     def _extract_mm_hashes(request: Dict[str, Any]) -> Optional[List[str]]:
         """Pull the per-image hashes the Rust frontend forwards via extra_args.
@@ -419,6 +431,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 bootstrap_room=bootstrap_info["bootstrap_room"],
                 external_trace_header=trace_header,
                 rid=trace_id,
+                session_id=self._resolve_engine_session_id(request),
                 data_parallel_rank=dp_rank,
                 lora_path=lora_path,
                 **logprob_kwargs,

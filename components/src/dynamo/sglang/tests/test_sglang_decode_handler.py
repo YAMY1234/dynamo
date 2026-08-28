@@ -209,11 +209,14 @@ def _new_decode_handler(
     use_sglang_tokenizer: bool = False,
     enable_rl: bool = False,
     decode_dp_rank_source: str = "router",
+    load_balance_method: str = "round_robin",
 ):
     handler = DecodeWorkerHandler.__new__(DecodeWorkerHandler)
     handler.use_sglang_tokenizer = use_sglang_tokenizer
     handler.config = SimpleNamespace(
-        server_args=SimpleNamespace(served_model_name="test-model"),
+        server_args=SimpleNamespace(
+            served_model_name="test-model", load_balance_method=load_balance_method
+        ),
         dynamo_args=SimpleNamespace(
             enable_rl=enable_rl, decode_dp_rank_source=decode_dp_rank_source
         ),
@@ -237,6 +240,19 @@ def test_decode_dp_rank_source():
         )
         is None
     )
+
+
+def test_engine_conversation_affinity_forwards_only_valid_session_id():
+    handler = _new_decode_handler(
+        decode_dp_rank_source="engine", load_balance_method="conversation_affinity"
+    )
+    assert handler._resolve_engine_session_id(
+        {"agent_context": {"session_id": "conversation-a"}}
+    ) == "conversation-a"
+    assert handler._resolve_engine_session_id({"agent_context": {}}) is None
+    assert _new_decode_handler()._resolve_engine_session_id(
+        {"agent_context": {"session_id": "conversation-a"}}
+    ) is None
 
 
 async def _stream(items):
