@@ -204,13 +204,21 @@ def test_openai_stop_sampling_params_maps_token_id_stop_array():
     }
 
 
-def _new_decode_handler(*, use_sglang_tokenizer: bool = False, enable_rl: bool = False):
+def _new_decode_handler(
+    *,
+    use_sglang_tokenizer: bool = False,
+    enable_rl: bool = False,
+    decode_dp_rank_source: str = "router",
+):
     handler = DecodeWorkerHandler.__new__(DecodeWorkerHandler)
     handler.use_sglang_tokenizer = use_sglang_tokenizer
     handler.config = SimpleNamespace(
         server_args=SimpleNamespace(served_model_name="test-model"),
-        dynamo_args=SimpleNamespace(enable_rl=enable_rl),
+        dynamo_args=SimpleNamespace(
+            enable_rl=enable_rl, decode_dp_rank_source=decode_dp_rank_source
+        ),
     )
+    handler._decode_dp_rank_source = decode_dp_rank_source
 
     @asynccontextmanager
     async def no_cancellation_monitor(*args, **kwargs):
@@ -218,6 +226,17 @@ def _new_decode_handler(*, use_sglang_tokenizer: bool = False, enable_rl: bool =
 
     handler._cancellation_monitor = no_cancellation_monitor
     return handler
+
+
+def test_decode_dp_rank_source():
+    routing = {"dp_rank": 3}
+    assert _new_decode_handler()._resolve_decode_dp_rank(routing) == 3
+    assert (
+        _new_decode_handler(decode_dp_rank_source="engine")._resolve_decode_dp_rank(
+            routing
+        )
+        is None
+    )
 
 
 async def _stream(items):

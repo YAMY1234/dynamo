@@ -160,6 +160,16 @@ class DynamoSGLangArgGroup(ArgGroup):
             "(1=minimal, 2=per-request [default], 3=+decode_loop, 4=full).",
         )
 
+        add_argument(
+            g,
+            flag_name="--decode-dp-rank-source",
+            env_var="DYN_SGL_DECODE_DP_RANK_SOURCE",
+            default="router",
+            choices=["router", "engine"],
+            help="Choose whether disaggregated decode uses the DP rank selected "
+            "by Dynamo or lets SGLang balance requests across DP ranks.",
+        )
+
 
 class DynamoSGLangConfig(ConfigBase):
     """Configuration for Dynamo SGLang wrapper (SGLang-specific only)."""
@@ -181,6 +191,7 @@ class DynamoSGLangConfig(ConfigBase):
     enable_rl: bool
     frontend_decoding: bool = False
     sglang_trace_level: int
+    decode_dp_rank_source: str
 
     # Extra served names beyond the primary, parsed from --served-model-name.
     # None (not []) since ConfigBase copies class defaults by reference.

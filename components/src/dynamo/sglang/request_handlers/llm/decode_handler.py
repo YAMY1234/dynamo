@@ -190,6 +190,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             str, Any
         ] = self._resolve_routed_experts_kwargs(self.engine, self.config.server_args)
         self._enable_frontend_decoding = enable_frontend_decoding
+        self._decode_dp_rank_source = getattr(
+            config.dynamo_args, "decode_dp_rank_source", "router"
+        )
         self._image_loader: Optional[ImageLoader] = None
         if self._enable_frontend_decoding:
             # Lazy-inits a NIXL connector internally for Decoded variants.
@@ -232,6 +235,11 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         """
         probe = filter_supported_async_generate_kwargs(engine, {"mm_hashes": None})
         return "mm_hashes" in probe
+
+    def _resolve_decode_dp_rank(self, routing: Dict[str, Any]) -> Optional[int]:
+        if self._decode_dp_rank_source == "engine":
+            return None
+        return routing.get("dp_rank")
 
     @staticmethod
     def _extract_mm_hashes(request: Dict[str, Any]) -> Optional[List[str]]:
@@ -393,7 +401,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
             # Extract dp_rank from routing info (set by KV router)
             routing = request.get("routing") or {}
-            dp_rank = routing.get("dp_rank")
+            dp_rank = self._resolve_decode_dp_rank(routing)
 
             # Decode re-extracts the media so its token layout matches prefill's
             # and the transferred KV lines up.
