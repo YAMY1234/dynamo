@@ -61,7 +61,15 @@ def publishes_kv_events(server_args: Any) -> bool:
     return not (nnodes > 1 and node_rank > 0)
 
 
-def model_card_dp_rank_bounds(server_args: Any) -> tuple[int, int]:
+def model_card_dp_rank_bounds(
+    server_args: Any, decode_dp_rank_source: str = "router"
+) -> tuple[int, int]:
+    if decode_dp_rank_source == "engine":
+        # Dynamo selects the physical decode worker while SGLang owns placement
+        # across that worker's local DP ranks. Advertise one logical routing slot
+        # so router load accounting follows the worker it actually dispatches to.
+        return 0, 1
+
     dp_size = getattr(server_args, "dp_size", 1) or 1
     return 0, dp_size
 

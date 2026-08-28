@@ -36,6 +36,7 @@ def test_model_card_registration_keeps_global_dp_range():
     )
 
     assert model_card_dp_rank_bounds(server_args) == (0, 16)
+    assert model_card_dp_rank_bounds(server_args, "engine") == (0, 1)
 
 
 def _args(**kwargs) -> SimpleNamespace:

@@ -162,7 +162,7 @@ async def test_hicache_publish_failure_preserves_core_capacity(monkeypatch, capl
         total_kv_blocks=64,
     )
 
-    monkeypatch.setattr(register, "model_card_dp_rank_bounds", lambda _: (0, 1))
+    monkeypatch.setattr(register, "model_card_dp_rank_bounds", lambda *_: (0, 1))
     monkeypatch.setattr(register, "get_sglang_worker_group_id", lambda _: None)
     monkeypatch.setattr(
         register, "_get_bootstrap_info_for_config", lambda _: (None, None)

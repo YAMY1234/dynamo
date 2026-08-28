@@ -378,7 +378,10 @@ async def _get_runtime_config(
     )
     runtime_config.kv_event_publishing_enabled = dynamo_args.use_kv_events
 
-    start_dp_rank, end_dp_rank = model_card_dp_rank_bounds(server_args)
+    start_dp_rank, end_dp_rank = model_card_dp_rank_bounds(
+        server_args,
+        dynamo_args.decode_dp_rank_source if is_decode_worker else "router",
+    )
     registered_dp_size = end_dp_rank - start_dp_rank
     runtime_config.data_parallel_start_rank = start_dp_rank
     runtime_config.data_parallel_size = registered_dp_size
