@@ -40,7 +40,7 @@ use crate::{
         OpenAIPreprocessor, PreprocessedEmbeddingRequest, prompt::prompt_formatter_from_mdc,
     },
     protocols::{
-        common::llm_backend::EmbeddingsEngineOutput,
+        common::{llm_backend::EmbeddingsEngineOutput, timing::RequestPhase},
         openai::{
             audios::{NvAudioSpeechResponse, NvCreateAudioSpeechRequest},
             chat_completions::{
@@ -623,9 +623,23 @@ impl ModelWatcher {
             // P/D rendezvous. Aggregated and Encode endpoints are independent
             // serving leaves and must not claim or perturb that pairing.
             let model_name = card.name().to_string();
-            let prefill_chooser = if needs_preprocessed_routing
-                && effective_worker_type(card.worker_type, card.model_type) == WorkerType::Decode
-            {
+            let disaggregated_decode = needs_preprocessed_routing
+                && effective_worker_type(card.worker_type, card.model_type) == WorkerType::Decode;
+            // Per-phase session affinity is frontend-owned: it comes from this frontend's
+            // configuration even when the worker advertises its own.
+            let host_phase = if disaggregated_decode {
+                RequestPhase::Decode
+            } else {
+                RequestPhase::Aggregated
+            };
+            let host_session_affinity = self.router_config.phase_session_affinity(host_phase)?;
+            let prefill_chooser = if disaggregated_decode {
+                tracing::info!(
+                    model_name = card.name(),
+                    session_affinity_ttl_secs = ?router_config.session_affinity_ttl_secs,
+                    session_affinity = ?host_session_affinity,
+                    "Decode hop session affinity"
+                );
                 let mut prefill_config = router_config.kv_router_config.clone();
                 prefill_config.router_track_active_blocks = false;
 
@@ -640,7 +654,8 @@ impl ModelWatcher {
                     self.plugins.selection_policy(),
                     self.prefill_load_estimator.clone(),
                     router_config.session_affinity_ttl_secs,
-                    router_config.session_affinity_mode,
+                    self.router_config
+                        .phase_session_affinity(RequestPhase::Prefill)?,
                     model_name.clone(),
                     namespace.clone(),
                     load_thresholds.clone(),
@@ -670,7 +685,7 @@ impl ModelWatcher {
 
             let preprocessed_routing = if needs_preprocessed_routing {
                 Some(
-                    entrypoint::input::build_preprocessed_routing_with_session_affinity_mode(
+                    entrypoint::input::build_preprocessed_routing_with_session_affinity(
                         &client,
                         self.manager.clone(),
                         router_config.router_mode,
@@ -682,7 +697,7 @@ impl ModelWatcher {
                         encoder_chooser.clone(),
                         uses_multimodal_cache_routing(card),
                         router_config.session_affinity_ttl_secs,
-                        router_config.session_affinity_mode,
+                        host_session_affinity,
                     )
                     .await
                     .context("build_preprocessed_routing")?,

@@ -1267,6 +1267,20 @@ impl KvRouterConfig {
             .and_then(super::policy_config::RouterPolicyConfig::request_classifier))
     }
 
+    /// Return the per-phase session-affinity overrides from `router_policy_config`, if any.
+    pub fn session_affinity_phases(
+        &self,
+    ) -> Result<
+        super::policy_config::SessionAffinityPhases,
+        super::policy_config::RouterPolicyConfigError,
+    > {
+        Ok(self
+            .loaded_policy_config()?
+            .and_then(super::policy_config::RouterPolicyConfig::session_affinity)
+            .copied()
+            .unwrap_or_default())
+    }
+
     /// Return one configured custom worker-selection instance, if any.
     ///
     /// `DYN_ROUTER_WORKER_SELECTION_POLICY` overrides the role-specific YAML selections. The

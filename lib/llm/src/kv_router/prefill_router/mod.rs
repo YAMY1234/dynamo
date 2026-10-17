@@ -37,7 +37,7 @@ use crate::{
     protocols::response_merge::{
         PREFILL_OUTPUT_ANNOTATION, PREFILL_OUTPUT_FIRST_ANNOTATION, PrefillNeed,
     },
-    session_affinity::{AffinityTarget, SessionAffinityMode},
+    session_affinity::{AffinityTarget, PhaseAffinity},
 };
 
 mod activation;
@@ -230,7 +230,8 @@ pub struct PrefillRouter {
     /// lives on [`PrefillBinding::prefill_router_mode`].
     decode_router_mode: RouterMode,
     session_affinity_ttl: Option<std::time::Duration>,
-    session_affinity_mode: SessionAffinityMode,
+    /// How the prefill hop applies session affinity; the decode hop's lives on its own host.
+    session_affinity: PhaseAffinity,
     conditional_disagg_policy: Box<dyn ConditionalDisaggPolicy>,
     /// Resolved once at construction: dedicated threshold if set, otherwise
     /// `router_queue_threshold`. `None` means the prefill-load condition is disabled.
@@ -266,7 +267,7 @@ struct PrefillBuildContext {
     selection_policy: SelectionPolicySource,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     session_affinity_ttl: Option<std::time::Duration>,
-    session_affinity_mode: SessionAffinityMode,
+    session_affinity: PhaseAffinity,
     model_name: String,
     load_thresholds: crate::discovery::LoadThresholdHandle,
     parent_token: CancellationToken,
@@ -779,6 +780,7 @@ fn merge_decode_topology_constraints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_affinity::SessionAffinityMode;
     use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
     use dynamo_runtime::{engine::AsyncEngine, pipeline::Error};
     use futures::StreamExt;

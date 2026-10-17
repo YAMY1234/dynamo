@@ -33,6 +33,9 @@ use dynamo_llm::mocker::make_mocker_engine;
 use dynamo_llm::model_card::ModelDeploymentCard as RsModelDeploymentCard;
 use dynamo_llm::reasoning_field::ReasoningField;
 use dynamo_llm::session_affinity::SessionAffinityMode as RsSessionAffinityMode;
+use dynamo_llm::session_affinity::{
+    PhaseAffinityConfig as RsPhaseAffinityConfig, SessionAffinityPhases as RsSessionAffinityPhases,
+};
 use dynamo_llm::types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine;
 
 use super::ais_callback::create_ais_prefill_load_estimator;
@@ -376,13 +379,27 @@ pub struct RouterConfig {
     active_prefill_tokens_threshold_frac: Option<f64>,
     session_affinity_ttl_secs: Option<u64>,
     session_affinity_mode: RsSessionAffinityMode,
+    session_affinity_phases: RsSessionAffinityPhases,
+}
+
+fn phase_affinity(mode: Option<&str>, binding: Option<&str>) -> PyResult<RsPhaseAffinityConfig> {
+    Ok(RsPhaseAffinityConfig {
+        mode: mode
+            .map(str::parse)
+            .transpose()
+            .map_err(PyValueError::new_err)?,
+        binding: binding
+            .map(str::parse)
+            .transpose()
+            .map_err(PyValueError::new_err)?,
+    })
 }
 
 #[pymethods]
 impl RouterConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false, session_affinity_ttl_secs=None, session_affinity_mode="hard"))]
+    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false, session_affinity_ttl_secs=None, session_affinity_mode="hard", prefill_session_affinity_mode=None, decode_session_affinity_mode=None, prefill_session_affinity_binding=None, decode_session_affinity_binding=None))]
     pub fn new(
         mode: RouterMode,
         config: Option<KvRouterConfig>,
@@ -392,6 +409,10 @@ impl RouterConfig {
         enforce_disagg: bool,
         session_affinity_ttl_secs: Option<u64>,
         session_affinity_mode: &str,
+        prefill_session_affinity_mode: Option<&str>,
+        decode_session_affinity_mode: Option<&str>,
+        prefill_session_affinity_binding: Option<&str>,
+        decode_session_affinity_binding: Option<&str>,
     ) -> PyResult<Self> {
         if enforce_disagg {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
@@ -412,6 +433,16 @@ impl RouterConfig {
         let session_affinity_mode = session_affinity_mode
             .parse()
             .map_err(PyValueError::new_err)?;
+        let session_affinity_phases = RsSessionAffinityPhases {
+            prefill: phase_affinity(
+                prefill_session_affinity_mode,
+                prefill_session_affinity_binding,
+            )?,
+            decode: phase_affinity(
+                decode_session_affinity_mode,
+                decode_session_affinity_binding,
+            )?,
+        };
         Ok(Self {
             router_mode: mode,
             kv_router_config: config.unwrap_or_default(),
@@ -420,6 +451,7 @@ impl RouterConfig {
             active_prefill_tokens_threshold_frac,
             session_affinity_ttl_secs,
             session_affinity_mode,
+            session_affinity_phases,
         })
     }
 }
@@ -437,6 +469,7 @@ impl From<RouterConfig> for RsRouterConfig {
             enforce_disagg: false,
             session_affinity_ttl_secs: rc.session_affinity_ttl_secs,
             session_affinity_mode: rc.session_affinity_mode,
+            session_affinity_phases: rc.session_affinity_phases,
         }
     }
 }

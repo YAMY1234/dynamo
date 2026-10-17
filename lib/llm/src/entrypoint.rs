@@ -17,9 +17,13 @@ use dynamo_runtime::{discovery::ModelCardInstanceId, pipeline::RouterMode};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    backend::ExecutionContext, discovery::LoadThresholdConfig, engines::StreamingEngine,
-    local_model::LocalModel, model_card::ModelDeploymentCard,
-    session_affinity::SessionAffinityMode,
+    backend::ExecutionContext,
+    discovery::LoadThresholdConfig,
+    engines::StreamingEngine,
+    local_model::LocalModel,
+    model_card::ModelDeploymentCard,
+    protocols::common::timing::RequestPhase,
+    session_affinity::{PhaseAffinity, SessionAffinityMode, SessionAffinityPhases},
     types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine,
 };
 
@@ -55,6 +59,9 @@ pub struct RouterConfig {
     pub session_affinity_ttl_secs: Option<u64>,
     #[serde(default)]
     pub session_affinity_mode: SessionAffinityMode,
+    /// Frontend-only per-phase overrides from flags; skipped so a worker card never carries them.
+    #[serde(skip)]
+    pub session_affinity_phases: SessionAffinityPhases,
 }
 
 impl RouterConfig {
@@ -66,6 +73,7 @@ impl RouterConfig {
             enforce_disagg: false,
             session_affinity_ttl_secs: None,
             session_affinity_mode: SessionAffinityMode::Hard,
+            session_affinity_phases: SessionAffinityPhases::default(),
         }
     }
 
@@ -85,6 +93,29 @@ impl RouterConfig {
     pub fn with_session_affinity_ttl_secs(mut self, ttl_secs: u64) -> Self {
         self.session_affinity_ttl_secs = Some(ttl_secs);
         self
+    }
+
+    /// The session affinity this frontend applies on one routing hop. On the prefill and decode
+    /// hops, a phase flag wins over the phase's `session_affinity` entry in the router policy
+    /// file, and anything left unset keeps the router-wide mode and parent-group binding.
+    pub fn phase_session_affinity(&self, phase: RequestPhase) -> anyhow::Result<PhaseAffinity> {
+        let (flags, file) = match phase {
+            RequestPhase::Aggregated => {
+                return Ok(PhaseAffinity::inherit(self.session_affinity_mode));
+            }
+            RequestPhase::Prefill => (
+                self.session_affinity_phases.prefill,
+                self.kv_router_config.session_affinity_phases()?.prefill,
+            ),
+            RequestPhase::Decode => (
+                self.session_affinity_phases.decode,
+                self.kv_router_config.session_affinity_phases()?.decode,
+            ),
+        };
+        Ok(PhaseAffinity::resolve(
+            flags.or(file),
+            self.session_affinity_mode,
+        ))
     }
 }
 

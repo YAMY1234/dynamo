@@ -40,8 +40,8 @@ use crate::{
         timing::{RequestPhase, RoutingData, WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL},
     },
     session_affinity::{
-        AffinityCoordinator, AffinityTarget, Hold, SessionAffinityMode, affinity_id,
-        explicit_target, from_table, invalid_argument, subagent_group_affinity_id,
+        AffinityCoordinator, AffinityTarget, Hold, SessionAffinityBinding, SessionAffinityMode,
+        affinity_id, explicit_target, from_table, invalid_argument, subagent_group_affinity_id,
     },
 };
 
@@ -298,6 +298,7 @@ pub struct RoutingHost {
     request_metrics: Arc<RouterRequestMetrics>,
     affinity: Option<AffinityCoordinator>,
     session_affinity_mode: SessionAffinityMode,
+    session_affinity_binding: SessionAffinityBinding,
     hosted_occupancy: Option<HostedOccupancy>,
     lora: Option<LoraRouting>,
     /// Retains the shared client, overload state, and cancellation subtree for this host.
@@ -444,6 +445,7 @@ impl RoutingHost {
                 .as_ref()
                 .map(AffinityCoordinator::mode)
                 .unwrap_or_default(),
+            session_affinity_binding: SessionAffinityBinding::default(),
             affinity,
             hosted_occupancy: None,
             lora: None,
@@ -521,6 +523,7 @@ impl RoutingHost {
                 .as_ref()
                 .map(AffinityCoordinator::mode)
                 .unwrap_or_default(),
+            session_affinity_binding: SessionAffinityBinding::default(),
             affinity,
             hosted_occupancy,
             lora: lora
@@ -532,6 +535,12 @@ impl RoutingHost {
                 }),
             routing_context: Some(load_context),
         })
+    }
+
+    /// Choose which key this host binds a session under.
+    pub(crate) fn with_session_affinity_binding(mut self, binding: SessionAffinityBinding) -> Self {
+        self.session_affinity_binding = binding;
+        self
     }
 
     pub fn required_worker_inputs(&self) -> WorkerInputs {
@@ -594,13 +603,14 @@ impl RoutingHost {
     /// The group key for a subagent: a request that carries a parent session id binds under the
     /// parent's group instead of its own session, so siblings share a worker while the parent
     /// keeps its own binding. An explicit per-request target stays on the request's own session so
-    /// it cannot be rejected against, or rebind, the group.
+    /// it cannot be rejected against, or rebind, the group. A host that binds by session never
+    /// groups.
     fn group_binding_id(
         &self,
         request: &SingleIn<PreprocessedRequest>,
         explicit: Option<AffinityTarget>,
     ) -> Option<Arc<SessionAffinityId>> {
-        if explicit.is_some() {
+        if explicit.is_some() || self.session_affinity_binding == SessionAffinityBinding::Session {
             return None;
         }
         let parent_session_id = request

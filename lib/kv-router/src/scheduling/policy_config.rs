@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -260,6 +261,7 @@ pub struct RouterPolicyConfig {
     models: HashMap<String, PolicyProfile>,
     worker_selection: Option<WorkerSelectionConfig>,
     request_classifier: Option<RequestClassifierConfig>,
+    session_affinity: Option<SessionAffinityPhases>,
 }
 
 impl RouterPolicyConfig {
@@ -317,9 +319,94 @@ impl RouterPolicyConfig {
         self.request_classifier.as_ref()
     }
 
+    /// Returns the per-phase session-affinity overrides, if present.
+    pub fn session_affinity(&self) -> Option<&SessionAffinityPhases> {
+        self.session_affinity.as_ref()
+    }
+
     /// Whether this document configures queue policy profiles.
     pub fn has_routing_profiles(&self) -> bool {
         self.root.is_some() || !self.models.is_empty()
+    }
+}
+
+/// The `session_affinity` section: how the prefill and decode hops of disaggregated serving
+/// apply session affinity. An omitted phase or field keeps the router-wide setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAffinityPhases {
+    #[serde(default)]
+    pub prefill: PhaseAffinityConfig,
+    #[serde(default)]
+    pub decode: PhaseAffinityConfig,
+}
+
+/// One phase's session-affinity overrides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseAffinityConfig {
+    pub mode: Option<PhaseAffinityMode>,
+    pub binding: Option<SessionAffinityBinding>,
+}
+
+impl PhaseAffinityConfig {
+    /// Each field set here wins over the same field in `fallback`.
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            mode: self.mode.or(fallback.mode),
+            binding: self.binding.or(fallback.binding),
+        }
+    }
+}
+
+/// How one phase applies session affinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseAffinityMode {
+    Hard,
+    Soft,
+    /// The phase routes as if session affinity were disabled.
+    Off,
+}
+
+impl FromStr for PhaseAffinityMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "hard" => Ok(Self::Hard),
+            "soft" => Ok(Self::Soft),
+            "off" => Ok(Self::Off),
+            _ => Err(format!(
+                "invalid phase session affinity mode {value:?}; expected 'hard', 'soft', or 'off'"
+            )),
+        }
+    }
+}
+
+/// Which key a phase binds a request's session under.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionAffinityBinding {
+    /// A request that carries a parent session id binds under its parent's group, so the
+    /// subagents of one parent share a target.
+    #[default]
+    ParentGroup,
+    /// Every request binds under its own session id.
+    Session,
+}
+
+impl FromStr for SessionAffinityBinding {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "parent-group" => Ok(Self::ParentGroup),
+            "session" => Ok(Self::Session),
+            _ => Err(format!(
+                "invalid session affinity binding {value:?}; expected 'parent-group' or 'session'"
+            )),
+        }
     }
 }
 
@@ -334,6 +421,7 @@ struct RawRouterPolicyConfig {
     models: HashMap<String, RawPolicyProfile>,
     worker_selection: Option<RawWorkerSelectionConfig>,
     request_classifier: Option<RawRequestClassifierConfig>,
+    session_affinity: Option<SessionAffinityPhases>,
 }
 
 impl RawRouterPolicyConfig {
@@ -391,9 +479,10 @@ impl RawRouterPolicyConfig {
             && models.is_empty()
             && worker_selection.is_none()
             && request_classifier.is_none()
+            && self.session_affinity.is_none()
         {
             return Err(RouterPolicyConfigError::Validation(
-                "router policy config must define router settings, a root profile, at least one model profile, worker_selection, or request_classifier".to_string(),
+                "router policy config must define router settings, a root profile, at least one model profile, worker_selection, request_classifier, or session_affinity".to_string(),
             ));
         }
 
@@ -403,6 +492,7 @@ impl RawRouterPolicyConfig {
             models,
             worker_selection,
             request_classifier,
+            session_affinity: self.session_affinity,
         })
     }
 }
@@ -862,6 +952,84 @@ worker_selection:
     - name: alpha
       type: alpha
       parameters: 1
+"#,
+        ] {
+            assert!(
+                RouterPolicyConfig::from_yaml(yaml).is_err(),
+                "unexpectedly accepted {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_affinity_only_config_overrides_each_phase_independently() {
+        let config = RouterPolicyConfig::from_yaml(
+            r#"
+session_affinity:
+  prefill:
+    mode: hard
+    binding: session
+  decode:
+    mode: off
+"#,
+        )
+        .unwrap();
+
+        let phases = config.session_affinity().unwrap();
+        assert_eq!(
+            phases.prefill,
+            PhaseAffinityConfig {
+                mode: Some(PhaseAffinityMode::Hard),
+                binding: Some(SessionAffinityBinding::Session),
+            }
+        );
+        assert_eq!(
+            phases.decode,
+            PhaseAffinityConfig {
+                mode: Some(PhaseAffinityMode::Off),
+                binding: None,
+            }
+        );
+        assert!(config.worker_selection().is_none());
+
+        let decode_only = RouterPolicyConfig::from_yaml(
+            r#"
+session_affinity:
+  decode:
+    binding: parent-group
+"#,
+        )
+        .unwrap();
+        let phases = decode_only.session_affinity().unwrap();
+        assert_eq!(phases.prefill, PhaseAffinityConfig::default());
+        assert_eq!(
+            phases.decode.binding,
+            Some(SessionAffinityBinding::ParentGroup)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_session_affinity_config() {
+        for yaml in [
+            r#"
+session_affinity:
+  aggregated:
+    mode: hard
+"#,
+            r#"
+session_affinity:
+  prefill:
+    mode: sticky
+"#,
+            r#"
+session_affinity:
+  decode:
+    binding: parent
+"#,
+            r#"
+session_affinity:
+  decode:
+    ttl_secs: 30
 "#,
         ] {
             assert!(

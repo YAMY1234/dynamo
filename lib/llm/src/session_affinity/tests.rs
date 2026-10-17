@@ -13,11 +13,13 @@ use futures::{StreamExt, stream};
 
 use super::SessionAffinityMode::{Hard, Soft};
 use super::{
-    AffinityCoordinator, AffinityTarget, Hold, LlmResponse, affinity_id,
+    AffinityCoordinator, AffinityTarget, Hold, LlmResponse, PhaseAffinity, PhaseAffinityConfig,
+    PhaseAffinityMode, SessionAffinityBinding, SessionAffinityPhases, affinity_id,
     coordinator::{ReplicaApplyOutcome, tracked_stream},
     explicit_target, subagent_group_affinity_id, to_table,
 };
 use crate::{
+    entrypoint::RouterConfig,
     preprocessor::PreprocessedRequest,
     protocols::common::{
         extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
@@ -891,4 +893,110 @@ fn a_subagent_group_id_is_namespaced_and_fixed_size() {
     let long = subagent_group_affinity_id(&"p".repeat(10_000));
     assert_eq!(long.len(), a.len());
     assert!(long.len() <= MAX_SESSION_AFFINITY_ID_BYTES);
+}
+
+fn phase(
+    mode: Option<PhaseAffinityMode>,
+    binding: Option<SessionAffinityBinding>,
+) -> PhaseAffinityConfig {
+    PhaseAffinityConfig { mode, binding }
+}
+
+#[test]
+fn phase_affinity_defaults_keep_the_router_wide_mode_and_parent_group() {
+    for mode in [Hard, Soft] {
+        let config = RouterConfig {
+            session_affinity_ttl_secs: Some(60),
+            session_affinity_mode: mode,
+            ..Default::default()
+        };
+        for phase in [
+            RequestPhase::Prefill,
+            RequestPhase::Decode,
+            RequestPhase::Aggregated,
+        ] {
+            assert_eq!(
+                config.phase_session_affinity(phase).unwrap(),
+                PhaseAffinity {
+                    mode: Some(mode),
+                    binding: SessionAffinityBinding::ParentGroup,
+                },
+                "{phase:?} under {mode:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn phase_affinity_flags_override_the_policy_file_per_field() {
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        policy_file.path(),
+        r#"
+session_affinity:
+  prefill:
+    mode: soft
+    binding: session
+  decode:
+    mode: hard
+    binding: session
+"#,
+    )
+    .unwrap();
+    let mut config = RouterConfig {
+        session_affinity_ttl_secs: Some(60),
+        ..Default::default()
+    };
+    config.kv_router_config.router_policy_config = Some(policy_file.path().display().to_string());
+    config.session_affinity_phases.decode = phase(Some(PhaseAffinityMode::Off), None);
+
+    assert_eq!(
+        config
+            .phase_session_affinity(RequestPhase::Prefill)
+            .unwrap(),
+        PhaseAffinity {
+            mode: Some(Soft),
+            binding: SessionAffinityBinding::Session,
+        }
+    );
+    // The flag turns decode off; the file still supplies the field the flag leaves unset.
+    assert_eq!(
+        config.phase_session_affinity(RequestPhase::Decode).unwrap(),
+        PhaseAffinity {
+            mode: None,
+            binding: SessionAffinityBinding::Session,
+        }
+    );
+    assert_eq!(
+        config
+            .phase_session_affinity(RequestPhase::Aggregated)
+            .unwrap(),
+        PhaseAffinity::inherit(Hard)
+    );
+}
+
+#[test]
+fn phase_affinity_flag_values_parse_and_never_reach_a_card() {
+    assert_eq!("off".parse(), Ok(PhaseAffinityMode::Off));
+    assert_eq!("soft".parse(), Ok(PhaseAffinityMode::Soft));
+    assert!("sticky".parse::<PhaseAffinityMode>().is_err());
+    assert_eq!("session".parse(), Ok(SessionAffinityBinding::Session));
+    assert_eq!(
+        "parent-group".parse(),
+        Ok(SessionAffinityBinding::ParentGroup)
+    );
+    assert!("parent".parse::<SessionAffinityBinding>().is_err());
+
+    let mut config = RouterConfig::default();
+    config.session_affinity_phases.decode = phase(
+        Some(PhaseAffinityMode::Off),
+        Some(SessionAffinityBinding::Session),
+    );
+    let card = serde_json::to_value(&config).unwrap();
+    assert!(card.get("session_affinity_phases").is_none());
+    let parsed: RouterConfig = serde_json::from_value(card).unwrap();
+    assert_eq!(
+        parsed.session_affinity_phases,
+        SessionAffinityPhases::default()
+    );
 }

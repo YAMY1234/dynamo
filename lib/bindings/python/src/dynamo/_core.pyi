@@ -1757,6 +1757,10 @@ class RouterConfig:
         enforce_disagg: bool = False,
         session_affinity_ttl_secs: Optional[int] = None,
         session_affinity_mode: str = "hard",
+        prefill_session_affinity_mode: Optional[str] = None,
+        decode_session_affinity_mode: Optional[str] = None,
+        prefill_session_affinity_binding: Optional[str] = None,
+        decode_session_affinity_binding: Optional[str] = None,
     ) -> None:
         """
         Create a RouterConfig.
@@ -1770,6 +1774,10 @@ class RouterConfig:
             enforce_disagg: Deprecated and ignored. Routing topology and readiness come from registered worker types.
             session_affinity_ttl_secs: Router-local session-affinity idle TTL in seconds.
             session_affinity_mode: Session binding behavior: ``hard`` or ``soft``.
+            prefill_session_affinity_mode: Prefill-hop override: ``hard``, ``soft``, or ``off``. Frontend-only.
+            decode_session_affinity_mode: Decode-hop override: ``hard``, ``soft``, or ``off``. Frontend-only.
+            prefill_session_affinity_binding: Prefill-hop binding key: ``parent-group`` or ``session``. Frontend-only.
+            decode_session_affinity_binding: Decode-hop binding key: ``parent-group`` or ``session``. Frontend-only.
         """
         ...
 

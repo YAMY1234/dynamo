@@ -38,6 +38,10 @@ _ROUTER_FIELDS: tuple[str, ...] = (
     "active_prefill_tokens_threshold_frac",
     "session_affinity_ttl_secs",
     "session_affinity_mode",
+    "prefill_session_affinity_mode",
+    "decode_session_affinity_mode",
+    "prefill_session_affinity_binding",
+    "decode_session_affinity_binding",
 )
 
 _ENFORCE_DISAGG_DEPRECATION = (
@@ -79,6 +83,11 @@ class RouterConfigBase(ConfigBase):
     enforce_disagg: bool
     session_affinity_ttl_secs: Optional[int]
     session_affinity_mode: str
+    # Frontend-only; a worker leaves them unset, and its card never carries them.
+    prefill_session_affinity_mode: Optional[str] = None
+    decode_session_affinity_mode: Optional[str] = None
+    prefill_session_affinity_binding: Optional[str] = None
+    decode_session_affinity_binding: Optional[str] = None
     active_decode_blocks_threshold: Optional[float]
     active_prefill_tokens_threshold: Optional[int]
     active_prefill_tokens_threshold_frac: Optional[float]
@@ -271,6 +280,63 @@ class RouterArgGroup(ArgGroup):
             choices=("hard", "soft"),
             dest="session_affinity_mode",
         )
+        if self.include_frontend_only:
+            # Per-phase overrides for the frontend's own prefill and decode hops.
+            add_argument(
+                g,
+                flag_name="--router-prefill-session-affinity-mode",
+                env_var="DYN_ROUTER_PREFILL_SESSION_AFFINITY_MODE",
+                default=None,
+                help=(
+                    "Session affinity on the disaggregated prefill hop: hard, soft, or off. "
+                    "Overrides session_affinity.prefill.mode in --router-policy-config. "
+                    "Unset uses --router-session-affinity-mode."
+                ),
+                choices=("hard", "soft", "off"),
+                dest="prefill_session_affinity_mode",
+            )
+            add_argument(
+                g,
+                flag_name="--router-decode-session-affinity-mode",
+                env_var="DYN_ROUTER_DECODE_SESSION_AFFINITY_MODE",
+                default=None,
+                help=(
+                    "Session affinity on the disaggregated decode hop: hard, soft, or off. "
+                    "Overrides session_affinity.decode.mode in --router-policy-config. "
+                    "Unset uses --router-session-affinity-mode."
+                ),
+                choices=("hard", "soft", "off"),
+                dest="decode_session_affinity_mode",
+            )
+            add_argument(
+                g,
+                flag_name="--router-prefill-session-affinity-binding",
+                env_var="DYN_ROUTER_PREFILL_SESSION_AFFINITY_BINDING",
+                default=None,
+                help=(
+                    "Key the prefill hop binds a request under. parent-group binds a "
+                    "subagent under its parent's group so siblings share a target; session "
+                    "binds every request under its own session id. Overrides "
+                    "session_affinity.prefill.binding in --router-policy-config. "
+                    "Unset uses parent-group."
+                ),
+                choices=("parent-group", "session"),
+                dest="prefill_session_affinity_binding",
+            )
+            add_argument(
+                g,
+                flag_name="--router-decode-session-affinity-binding",
+                env_var="DYN_ROUTER_DECODE_SESSION_AFFINITY_BINDING",
+                default=None,
+                help=(
+                    "Key the decode hop binds a request under: parent-group or session, as "
+                    "for --router-prefill-session-affinity-binding. Overrides "
+                    "session_affinity.decode.binding in --router-policy-config. "
+                    "Unset uses parent-group."
+                ),
+                choices=("parent-group", "session"),
+                dest="decode_session_affinity_binding",
+            )
         add_argument(
             g,
             flag_name="--active-decode-blocks-threshold",

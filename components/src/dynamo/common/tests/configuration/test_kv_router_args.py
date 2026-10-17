@@ -29,6 +29,10 @@ def _clear_rejection_threshold_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "DYN_ADMISSION_CONTROL",
         "DYN_ROUTER_QUEUE_THRESHOLD",
         "DYN_ROUTER_SESSION_AFFINITY_MODE",
+        "DYN_ROUTER_PREFILL_SESSION_AFFINITY_MODE",
+        "DYN_ROUTER_DECODE_SESSION_AFFINITY_MODE",
+        "DYN_ROUTER_PREFILL_SESSION_AFFINITY_BINDING",
+        "DYN_ROUTER_DECODE_SESSION_AFFINITY_BINDING",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -642,6 +646,10 @@ def test_frontend_rejection_thresholds_default_to_none(
         "active_prefill_tokens_threshold_frac": None,
         "session_affinity_ttl_secs": None,
         "session_affinity_mode": "hard",
+        "prefill_session_affinity_mode": None,
+        "decode_session_affinity_mode": None,
+        "prefill_session_affinity_binding": None,
+        "decode_session_affinity_binding": None,
     }
     assert "busy-worker rejection disabled" in caplog.text
 
@@ -772,6 +780,10 @@ def test_all_rejection_thresholds_and_queue_override_are_forwarded(
         "active_prefill_tokens_threshold_frac": 2.0,
         "session_affinity_ttl_secs": None,
         "session_affinity_mode": "hard",
+        "prefill_session_affinity_mode": None,
+        "decode_session_affinity_mode": None,
+        "prefill_session_affinity_binding": None,
+        "decode_session_affinity_binding": None,
     }
     assert config.kv_router_kwargs()["router_queue_threshold"] == 32.0
 
@@ -960,6 +972,45 @@ def test_session_affinity_mode_cli_and_environment(monkeypatch) -> None:
         parser.parse_args(["--router-session-affinity-mode", "hard"])
     )
     assert config.session_affinity_mode == "hard"
+
+
+def test_per_phase_session_affinity_cli_and_environment(monkeypatch) -> None:
+    _clear_rejection_threshold_env(monkeypatch)
+    phase_fields = (
+        "prefill_session_affinity_mode",
+        "decode_session_affinity_mode",
+        "prefill_session_affinity_binding",
+        "decode_session_affinity_binding",
+    )
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+    config = FrontendConfig.from_cli_args(parser.parse_args([]))
+    assert all(config.router_kwargs()[field] is None for field in phase_fields)
+
+    monkeypatch.setenv("DYN_ROUTER_DECODE_SESSION_AFFINITY_MODE", "off")
+    monkeypatch.setenv("DYN_ROUTER_PREFILL_SESSION_AFFINITY_BINDING", "session")
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+    config = FrontendConfig.from_cli_args(
+        parser.parse_args(
+            [
+                "--router-prefill-session-affinity-mode",
+                "hard",
+                "--router-decode-session-affinity-binding",
+                "parent-group",
+            ]
+        )
+    )
+    kwargs = config.router_kwargs()
+    assert kwargs["prefill_session_affinity_mode"] == "hard"
+    assert kwargs["decode_session_affinity_mode"] == "off"
+    assert kwargs["prefill_session_affinity_binding"] == "session"
+    assert kwargs["decode_session_affinity_binding"] == "parent-group"
+
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--router-decode-session-affinity-mode", "sticky"])
 
 
 @pytest.mark.parametrize("ttl", [0, 31_536_001])

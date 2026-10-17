@@ -596,7 +596,8 @@ class KvRouterArgGroup(ArgGroup):
             default=None,
             help=(
                 "KV Router: Startup-only YAML configuration for shared router settings, "
-                "policy-class queues, and worker-selection instances. "
+                "policy-class queues, worker-selection instances, and per-phase "
+                "session_affinity. "
                 "When omitted, router_queue_threshold and router_queue_policy define "
                 "one synthetic policy class; queueing remains disabled unless "
                 "router_queue_threshold is set."

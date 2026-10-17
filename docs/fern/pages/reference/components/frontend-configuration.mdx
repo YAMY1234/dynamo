@@ -127,6 +127,47 @@ router. See [Router Guide](../../developer-guide/knowledge-base/modular-componen
   Environment variable: `DYN_ROUTER_SESSION_AFFINITY_TTL_SECS`
 </ParamField>
 
+<ParamField path="--router-prefill-session-affinity-mode" type="string" default="null">
+  Session affinity on the disaggregated prefill hop. `off` routes that hop without session
+  affinity. Overrides `session_affinity.prefill.mode` in `--router-policy-config`; unset uses
+  `--router-session-affinity-mode`. See [Configure Prefill and Decode Separately](../../developer-guide/knowledge-base/modular-components/router/configuration-and-tuning.md#configure-prefill-and-decode-separately).
+
+  <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>hard</Badge> <Badge intent="note" minimal>soft</Badge> <Badge intent="note" minimal>off</Badge></span>
+
+  Environment variable: `DYN_ROUTER_PREFILL_SESSION_AFFINITY_MODE`
+</ParamField>
+
+<ParamField path="--router-decode-session-affinity-mode" type="string" default="null">
+  Session affinity on the disaggregated decode hop. `off` routes that hop without session
+  affinity. Overrides `session_affinity.decode.mode` in `--router-policy-config`; unset uses
+  `--router-session-affinity-mode`.
+
+  <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>hard</Badge> <Badge intent="note" minimal>soft</Badge> <Badge intent="note" minimal>off</Badge></span>
+
+  Environment variable: `DYN_ROUTER_DECODE_SESSION_AFFINITY_MODE`
+</ParamField>
+
+<ParamField path="--router-prefill-session-affinity-binding" type="string" default="null">
+  Key the prefill hop binds a request under. `parent-group` binds a subagent under its parent's
+  group, so siblings share a target; `session` binds every request under its own session id.
+  Overrides `session_affinity.prefill.binding` in `--router-policy-config`; unset uses
+  `parent-group`.
+
+  <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>parent-group</Badge> <Badge intent="note" minimal>session</Badge></span>
+
+  Environment variable: `DYN_ROUTER_PREFILL_SESSION_AFFINITY_BINDING`
+</ParamField>
+
+<ParamField path="--router-decode-session-affinity-binding" type="string" default="null">
+  Key the decode hop binds a request under, with the same values as
+  `--router-prefill-session-affinity-binding`. Overrides `session_affinity.decode.binding` in
+  `--router-policy-config`; unset uses `parent-group`.
+
+  <span className="enum-values"><span className="enum-label">Allowed values:</span> <Badge intent="note" minimal>parent-group</Badge> <Badge intent="note" minimal>session</Badge></span>
+
+  Environment variable: `DYN_ROUTER_DECODE_SESSION_AFFINITY_BINDING`
+</ParamField>
+
 <ParamField path="--decode-fallback / --no-decode-fallback" type="boolean" default="false">
   Fall back to aggregated mode when prefill workers are unavailable.
 
@@ -348,7 +389,7 @@ Configure scoring through [default policy parameters](../../developer-guide/know
 </ParamField>
 
 <ParamField path="--router-policy-config" type="string" default="null">
-  Startup-only YAML for shared `router` settings, policy-class queues, and worker-selection instances. When omitted,
+  Startup-only YAML for shared `router` settings, policy-class queues, worker-selection instances, and per-phase `session_affinity`. When omitted,
   `--router-queue-threshold` and `--router-queue-policy` define one synthetic policy class.
   Queueing remains disabled until a threshold is configured. See [Shared Router Settings](../../developer-guide/knowledge-base/modular-components/router/configuration-and-tuning.md#shared-router-settings), [Policy-class queues](../../developer-guide/knowledge-base/modular-components/router/configuration-and-tuning.md#policy-class-queues) and [Write Custom Routing Strategies](../../developer-guide/knowledge-base/modular-components/router/custom-worker-selection.mdx).
 

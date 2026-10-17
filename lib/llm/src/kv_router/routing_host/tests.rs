@@ -45,6 +45,9 @@ use crate::{
         preprocessor::{MmRoutingInfo, RoutingHints},
         timing::RequestTracker,
     },
+    session_affinity::{
+        PhaseAffinity, PhaseAffinityConfig, PhaseAffinityMode, SessionAffinityPhases,
+    },
 };
 
 fn request() -> PreprocessedRequest {
@@ -4348,6 +4351,16 @@ fn parent_group_id(parent_session_id: &str) -> SessionAffinityId {
 }
 
 async fn affinity_mode_host(namespace: &str) -> (Runtime, RoutingHost) {
+    phase_affinity_host(
+        namespace,
+        PhaseAffinity::inherit(crate::session_affinity::SessionAffinityMode::Hard),
+    )
+    .await
+}
+
+/// One routing hop built from its phase's settings, as the frontend builds it: a phase with
+/// affinity off gets no coordinator, and the phase's binding decides how subagents are keyed.
+async fn phase_affinity_host(namespace: &str, affinity: PhaseAffinity) -> (Runtime, RoutingHost) {
     let runtime = Runtime::from_current().unwrap();
     let distributed = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
         .await
@@ -4365,13 +4378,12 @@ async fn affinity_mode_host(namespace: &str) -> (Runtime, RoutingHost) {
     let inner = PushRouter::from_client(client, RouterMode::RoundRobin)
         .await
         .unwrap();
-    let coordinator = AffinityCoordinator::new(
-        Duration::from_secs(60),
-        crate::session_affinity::SessionAffinityMode::Hard,
-    )
-    .unwrap();
-    let host =
-        RoutingHost::new_builtin_with_coordinator(inner, load_context, Some(coordinator)).unwrap();
+    let coordinator = affinity
+        .mode
+        .map(|mode| AffinityCoordinator::new(Duration::from_secs(60), mode).unwrap());
+    let host = RoutingHost::new_builtin_with_coordinator(inner, load_context, coordinator)
+        .unwrap()
+        .with_session_affinity_binding(affinity.binding);
     (runtime, host)
 }
 
@@ -4512,4 +4524,227 @@ async fn hard_parent_group_recovers_when_the_bound_worker_leaves() {
     assert_eq!(affinity.query_target(&group, None).unwrap(), None);
 
     runtime.shutdown();
+}
+
+/// Route `request` through `host`'s session affinity, commit the hop to `fallback` when it
+/// offered nothing, and return what the hop offered.
+async fn route_and_bind(
+    host: &RoutingHost,
+    request: &SingleIn<PreprocessedRequest>,
+    phase: RequestPhase,
+    fallback: AffinityTarget,
+) -> Option<AffinityTarget> {
+    let (offered, hold) = host
+        .select_with_session_affinity(request, phase, false, &CleanupBudget::default(), |target| {
+            std::future::ready(Ok(target))
+        })
+        .await
+        .unwrap();
+    let mut stream = host
+        .bind_affinity(
+            hold,
+            offered.unwrap_or(fallback),
+            ResponseStream::new(
+                Box::pin(stream::iter([Annotated::from_data(
+                    LLMEngineOutput::default(),
+                )])),
+                request.context(),
+            ),
+        )
+        .unwrap();
+    while stream.next().await.is_some() {}
+    offered
+}
+
+fn phase_config(
+    prefill: PhaseAffinityConfig,
+    decode: PhaseAffinityConfig,
+) -> crate::entrypoint::RouterConfig {
+    crate::entrypoint::RouterConfig {
+        session_affinity_ttl_secs: Some(60),
+        session_affinity_phases: SessionAffinityPhases { prefill, decode },
+        ..Default::default()
+    }
+}
+
+async fn phase_hosts(
+    config: &crate::entrypoint::RouterConfig,
+) -> ((Runtime, RoutingHost), (Runtime, RoutingHost)) {
+    let prefill = config
+        .phase_session_affinity(RequestPhase::Prefill)
+        .unwrap();
+    let decode = config.phase_session_affinity(RequestPhase::Decode).unwrap();
+    (
+        phase_affinity_host("phase-affinity-prefill", prefill).await,
+        phase_affinity_host("phase-affinity-decode", decode).await,
+    )
+}
+
+const FIRST: AffinityTarget = AffinityTarget {
+    worker_id: 7,
+    dp_rank: Some(0),
+};
+const ELSEWHERE: AffinityTarget = AffinityTarget {
+    worker_id: 9,
+    dp_rank: Some(1),
+};
+
+#[tokio::test]
+#[serial_test::serial]
+async fn per_phase_affinity_pins_prefill_and_frees_decode() {
+    let config = phase_config(
+        PhaseAffinityConfig {
+            mode: Some(PhaseAffinityMode::Hard),
+            binding: None,
+        },
+        PhaseAffinityConfig {
+            mode: Some(PhaseAffinityMode::Off),
+            binding: None,
+        },
+    );
+    let ((prefill_runtime, prefill), (decode_runtime, decode)) = phase_hosts(&config).await;
+
+    let first_turn = subagent_request("conversation-1", None);
+    assert_eq!(
+        route_and_bind(&prefill, &first_turn, RequestPhase::Prefill, FIRST).await,
+        None
+    );
+    assert_eq!(
+        route_and_bind(&decode, &first_turn, RequestPhase::Decode, FIRST).await,
+        None
+    );
+
+    let next_turn = subagent_request("conversation-1", None);
+    assert_eq!(prefill.session_affinity_mode, SessionAffinityMode::Hard);
+    assert_eq!(
+        route_and_bind(&prefill, &next_turn, RequestPhase::Prefill, ELSEWHERE).await,
+        Some(FIRST),
+        "the prefill hop pins the session to its first target"
+    );
+    assert!(decode.affinity.is_none());
+    assert_eq!(
+        route_and_bind(&decode, &next_turn, RequestPhase::Decode, ELSEWHERE).await,
+        None,
+        "the decode hop selects freely"
+    );
+    // A TTL alone does not give a phase with affinity off a coordinator.
+    let decode_affinity = config.phase_session_affinity(RequestPhase::Decode).unwrap();
+    assert!(
+        crate::session_affinity::create_affinity_coordinator(
+            config.session_affinity_ttl_secs.map(Duration::from_secs),
+            decode_affinity.mode,
+            decode.inner.client.clone(),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    prefill_runtime.shutdown();
+    decode_runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn per_phase_affinity_frees_prefill_and_pins_decode() {
+    // Decode leaves its mode unset, so it keeps the router-wide hard mode.
+    let config = phase_config(
+        PhaseAffinityConfig {
+            mode: Some(PhaseAffinityMode::Off),
+            binding: None,
+        },
+        PhaseAffinityConfig::default(),
+    );
+    let ((prefill_runtime, prefill), (decode_runtime, decode)) = phase_hosts(&config).await;
+
+    let first_turn = subagent_request("conversation-1", None);
+    route_and_bind(&prefill, &first_turn, RequestPhase::Prefill, FIRST).await;
+    route_and_bind(&decode, &first_turn, RequestPhase::Decode, FIRST).await;
+
+    let next_turn = subagent_request("conversation-1", None);
+    assert!(prefill.affinity.is_none());
+    assert_eq!(
+        route_and_bind(&prefill, &next_turn, RequestPhase::Prefill, ELSEWHERE).await,
+        None
+    );
+    assert_eq!(decode.session_affinity_mode, SessionAffinityMode::Hard);
+    assert_eq!(
+        route_and_bind(&decode, &next_turn, RequestPhase::Decode, ELSEWHERE).await,
+        Some(FIRST)
+    );
+
+    prefill_runtime.shutdown();
+    decode_runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn per_phase_affinity_defaults_bind_both_phases_under_the_parent_group() {
+    let config = phase_config(
+        PhaseAffinityConfig::default(),
+        PhaseAffinityConfig::default(),
+    );
+    let ((prefill_runtime, prefill), (decode_runtime, decode)) = phase_hosts(&config).await;
+
+    for (host, phase) in [
+        (&prefill, RequestPhase::Prefill),
+        (&decode, RequestPhase::Decode),
+    ] {
+        assert_eq!(host.session_affinity_mode, SessionAffinityMode::Hard);
+        let first = subagent_request("child-1", Some("parent-1"));
+        assert_eq!(route_and_bind(host, &first, phase, FIRST).await, None);
+        let sibling = subagent_request("child-2", Some("parent-1"));
+        assert_eq!(
+            route_and_bind(host, &sibling, phase, ELSEWHERE).await,
+            Some(FIRST),
+            "{phase:?} keeps sharing the parent's group"
+        );
+    }
+
+    prefill_runtime.shutdown();
+    decode_runtime.shutdown();
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn per_phase_binding_keys_prefill_by_session_and_decode_by_parent_group() {
+    let config = phase_config(
+        PhaseAffinityConfig {
+            mode: None,
+            binding: Some(SessionAffinityBinding::Session),
+        },
+        PhaseAffinityConfig::default(),
+    );
+    let ((prefill_runtime, prefill), (decode_runtime, decode)) = phase_hosts(&config).await;
+
+    let first = subagent_request("child-1", Some("parent-1"));
+    route_and_bind(&prefill, &first, RequestPhase::Prefill, FIRST).await;
+    route_and_bind(&decode, &first, RequestPhase::Decode, FIRST).await;
+
+    let sibling = subagent_request("child-2", Some("parent-1"));
+    assert_eq!(
+        route_and_bind(&prefill, &sibling, RequestPhase::Prefill, ELSEWHERE).await,
+        None,
+        "on prefill a sibling starts its own binding"
+    );
+    assert_eq!(
+        route_and_bind(&decode, &sibling, RequestPhase::Decode, ELSEWHERE).await,
+        Some(FIRST),
+        "on decode a sibling joins the parent's group"
+    );
+
+    let first_next_turn = subagent_request("child-1", Some("parent-1"));
+    assert_eq!(
+        route_and_bind(&prefill, &first_next_turn, RequestPhase::Prefill, ELSEWHERE).await,
+        Some(FIRST),
+        "a subagent's own later turns stay pinned on prefill"
+    );
+    let sibling_next_turn = subagent_request("child-2", Some("parent-1"));
+    assert_eq!(
+        route_and_bind(&prefill, &sibling_next_turn, RequestPhase::Prefill, FIRST).await,
+        Some(ELSEWHERE)
+    );
+
+    prefill_runtime.shutdown();
+    decode_runtime.shutdown();
 }

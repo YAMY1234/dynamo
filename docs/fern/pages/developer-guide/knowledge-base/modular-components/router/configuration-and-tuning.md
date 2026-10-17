@@ -402,6 +402,51 @@ Session affinity does not create a backend session or send lifecycle RPCs. There
 no explicit unbind; idle expiry removes only router-local state. The same session
 ID is available to tracing and other explicitly configured consumers.
 
+### Configure Prefill and Decode Separately
+
+By default, the prefill and decode hops both use `--router-session-affinity-mode` and bind a
+subagent under its parent's group. To give one hop a different mode or binding key, add a
+`session_affinity` section to the file that `--router-policy-config` points at:
+
+```yaml
+session_affinity:
+  prefill:
+    mode: hard
+    binding: session
+  decode:
+    mode: off
+```
+
+| Key | Values | When unset |
+|---|---|---|
+| `mode` | `hard` or `soft`, as described above, or `off`, which routes that hop as if session affinity were disabled | `--router-session-affinity-mode` |
+| `binding` | `parent-group` binds a request that carries a parent session id under its parent's group. `session` binds every request under its own session id | `parent-group` |
+
+Each frontend flag below, and its environment variable, overrides one field of the file entry:
+
+| Flag | Environment variable |
+|---|---|
+| `--router-prefill-session-affinity-mode` | `DYN_ROUTER_PREFILL_SESSION_AFFINITY_MODE` |
+| `--router-decode-session-affinity-mode` | `DYN_ROUTER_DECODE_SESSION_AFFINITY_MODE` |
+| `--router-prefill-session-affinity-binding` | `DYN_ROUTER_PREFILL_SESSION_AFFINITY_BINDING` |
+| `--router-decode-session-affinity-binding` | `DYN_ROUTER_DECODE_SESSION_AFFINITY_BINDING` |
+
+The file is read with `--router-mode kv`; with other router modes, use the flags. These settings
+belong to the frontend: a worker's advertised router configuration does not set them. They take
+effect only while session affinity is enabled, and aggregated serving always uses the router-wide
+settings. The decode setting also covers requests that decode workers serve without a prefill hop.
+
+A prefill binding, like a decode binding, records the data-parallel rank. With data-parallel
+prefill workers, `hard` therefore keeps a session on one prefill rank. `binding: session` lets each
+subagent's first request choose its rank through normal selection. `parent-group` places every
+subagent of one parent on the rank that served the first of them, which reuses their shared prefix
+but can concentrate a large fan-out on one rank.
+
+For agentic workloads with subagent fan-out on disaggregated serving, start from the example above:
+keep the prefill binding (`hard`, with `session` or `parent-group`), which keeps each conversation
+on the prefill worker that holds its cached prefix, and turn decode affinity `off`, so decode
+placement follows load instead of pinning a parent's subagents to one decode rank.
+
 <a id="aic-prefill-load-model"></a>
 
 ### AIS Prefill Load Model

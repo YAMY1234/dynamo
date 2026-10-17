@@ -28,7 +28,7 @@ use crate::{
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
         timing::WORKER_TYPE_PREFILL,
     },
-    session_affinity::{SessionAffinityMode, create_affinity_coordinator},
+    session_affinity::{PhaseAffinity, SessionAffinityMode, create_affinity_coordinator},
 };
 
 /// How the prefill worker set wants to be routed to, resolved from its cards.
@@ -106,11 +106,11 @@ impl PrefillRouter {
         decode_router_mode: RouterMode,
         session_affinity_ttl_secs: Option<u64>,
     ) -> Arc<Self> {
-        Self::disabled_with_session_affinity_mode(
+        Self::disabled_with_session_affinity(
             model_manager,
             decode_router_mode,
             session_affinity_ttl_secs,
-            SessionAffinityMode::Hard,
+            PhaseAffinity::inherit(SessionAffinityMode::Hard),
         )
     }
 
@@ -141,7 +141,7 @@ impl PrefillRouter {
             SelectionPolicySource::Registry,
             prefill_load_estimator,
             session_affinity_ttl_secs,
-            session_affinity_mode,
+            PhaseAffinity::inherit(session_affinity_mode),
             model_name,
             namespace,
             load_thresholds,
@@ -152,11 +152,11 @@ impl PrefillRouter {
 }
 
 impl PrefillRouter {
-    pub(crate) fn disabled_with_session_affinity_mode(
+    pub(crate) fn disabled_with_session_affinity(
         model_manager: Arc<ModelManager>,
         decode_router_mode: RouterMode,
         session_affinity_ttl_secs: Option<u64>,
-        session_affinity_mode: SessionAffinityMode,
+        session_affinity: PhaseAffinity,
     ) -> Arc<Self> {
         Arc::new(Self {
             binding: arc_swap::ArcSwapOption::empty(),
@@ -168,7 +168,7 @@ impl PrefillRouter {
             cancel_token: tokio_util::sync::CancellationToken::new(),
             decode_router_mode,
             session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
-            session_affinity_mode,
+            session_affinity,
             conditional_disagg_policy: make_conditional_disagg_policy(None),
             conditional_disagg_prefill_busy_threshold: None,
             conditional_disagg_decode_busy_threshold: None,
@@ -192,7 +192,7 @@ impl PrefillRouter {
         selection_policy: SelectionPolicySource,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         session_affinity_ttl_secs: Option<u64>,
-        session_affinity_mode: SessionAffinityMode,
+        session_affinity: PhaseAffinity,
         model_name: String,
         namespace: String,
         load_thresholds: LoadThresholdHandle,
@@ -220,7 +220,7 @@ impl PrefillRouter {
             cancel_token: cancel_token.clone(),
             decode_router_mode,
             session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
-            session_affinity_mode,
+            session_affinity,
             conditional_disagg_policy,
             conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold,
@@ -352,6 +352,7 @@ impl PrefillRouter {
             is_eagle = advertisement.is_eagle,
             block_size = prefill_block_size,
             session_affinity_ttl = ?prefill_session_affinity_ttl,
+            session_affinity = ?context.session_affinity,
             kv_tuning = ?prefill_kv_config,
             "Activating prefill router"
         );
@@ -377,7 +378,7 @@ impl PrefillRouter {
 
             let affinity = create_affinity_coordinator(
                 prefill_session_affinity_ttl,
-                context.session_affinity_mode,
+                context.session_affinity.mode,
                 client.clone(),
             )
             .await?;
@@ -390,16 +391,19 @@ impl PrefillRouter {
             )
             .await?;
 
-            Arc::new(RoutingHost::new_with_load_context_and_coordinator(
-                push_router,
-                kv_chooser,
-                load_context.clone(),
-                affinity,
-            ))
+            Arc::new(
+                RoutingHost::new_with_load_context_and_coordinator(
+                    push_router,
+                    kv_chooser,
+                    load_context.clone(),
+                    affinity,
+                )
+                .with_session_affinity_binding(context.session_affinity.binding),
+            )
         } else {
             let affinity = create_affinity_coordinator(
                 prefill_session_affinity_ttl,
-                context.session_affinity_mode,
+                context.session_affinity.mode,
                 client.clone(),
             )
             .await?;
@@ -414,11 +418,14 @@ impl PrefillRouter {
             )
             .await?;
 
-            Arc::new(RoutingHost::new_builtin_with_coordinator(
-                push_router,
-                load_context.clone(),
-                affinity,
-            )?)
+            Arc::new(
+                RoutingHost::new_builtin_with_coordinator(
+                    push_router,
+                    load_context.clone(),
+                    affinity,
+                )?
+                .with_session_affinity_binding(context.session_affinity.binding),
+            )
         };
 
         Ok(PrefillBinding {
@@ -526,7 +533,7 @@ impl PrefillRouter {
                     .expect("enabled prefill router has a selection policy"),
                 prefill_load_estimator: router_ref.prefill_load_estimator.clone(),
                 session_affinity_ttl: router_ref.session_affinity_ttl,
-                session_affinity_mode: router_ref.session_affinity_mode,
+                session_affinity: router_ref.session_affinity,
                 model_name: router_ref.model_name.clone(),
                 load_thresholds: load_thresholds.clone(),
                 parent_token: cancel_token.child_token(),
@@ -894,7 +901,7 @@ mod tests {
             SelectionPolicySource::Registry,
             None,
             None,
-            SessionAffinityMode::Hard,
+            PhaseAffinity::inherit(SessionAffinityMode::Hard),
             "test-model".into(),
             namespace,
             LoadThresholdHandle::new(Default::default()),
