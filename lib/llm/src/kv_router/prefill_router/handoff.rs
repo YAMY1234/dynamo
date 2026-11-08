@@ -105,7 +105,7 @@ impl PrefillTask {
 
     /// Observe prefill failures both during decode dispatch and while streaming.
     /// Successful decode terminals wait only for required prefill metadata.
-    /// After success, drain decode and await prefill cleanup; late failures are logged.
+    /// After success, the response ends with decode; prefill finishes in its own task.
     /// `output` sends prefill's output into the stream as soon as prefill
     /// finishes (`BeforeLast`), or before any decode output (`BeforeFirst`).
     pub(super) async fn forward_decode(
@@ -249,10 +249,8 @@ impl PrefillTask {
                             while let Some(output) = response.next().await {
                                 yield output;
                             }
-                            if !emit {
-                                // Success is delivered; the prefill task logs late failures.
-                                let _ = completion.await;
-                            }
+                            // Success is delivered. The detached prefill task still drains
+                            // its stream, so router bookkeeping completes and late failures are logged.
                             return;
                         }
                     }
@@ -379,7 +377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tokens_flow_while_prefill_is_pending_but_close_waits() {
+    async fn response_closes_with_decode_while_prefill_is_pending() {
         let (tx, task) = pending_prefill();
         let context = Arc::new(Controller::default());
         let token = LLMEngineOutput {
@@ -413,14 +411,16 @@ mod tests {
             Some(FinishReason::Length)
         );
         assert!(response.next().now_or_never().is_none());
-        tx.send(Ok(None)).unwrap();
         decode_tx
             .unbounded_send(Annotated::from_data(token))
             .unwrap();
         assert_eq!(response.next().await.unwrap().data.unwrap().token_ids, [42]);
         assert!(response.next().now_or_never().is_none());
         drop(decode_tx);
-        assert!(response.next().await.is_none());
+        // Decode EOF ends the response even though prefill has not finished.
+        assert!(response.next().now_or_never().unwrap().is_none());
+        drop(response);
+        tx.send(Ok(None)).unwrap();
         assert!(!context.is_stopped());
     }
 
@@ -448,9 +448,8 @@ mod tests {
             terminal.data.unwrap().finish_reason,
             Some(FinishReason::Length)
         );
-        assert!(response.next().now_or_never().is_none());
+        assert!(response.next().now_or_never().unwrap().is_none());
         tx.send(failure()).unwrap();
-        assert!(response.next().await.is_none());
     }
 
     #[tokio::test]

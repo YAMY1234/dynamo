@@ -401,6 +401,83 @@ mod tests {
         }
     }
 
+    /// The response closes at decode EOF; prefill's trailing cache-hit report is still read.
+    #[tokio::test]
+    async fn bootstrap_tail_is_consumed_after_decode_closes_response() {
+        let first = Annotated::from_data(LLMEngineOutput {
+            disaggregated_params: Some(json!({
+                "bootstrap_host": "prefill", "bootstrap_port": 1, "bootstrap_room": 7,
+            })),
+            ..Default::default()
+        });
+        let kv_cache_hit = json!({"kv_cache_hit": {"prompt_tokens": 100, "reused_tokens": 64}});
+        let tail = Annotated::from_data(LLMEngineOutput {
+            engine_data: Some(kv_cache_hit.clone()),
+            ..Default::default()
+        });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Stands in for the prefill route's monitor, which applies the report per item.
+        let stream = stream::iter([first])
+            .chain(stream::once(async move {
+                release_rx.await.unwrap();
+                tail
+            }))
+            .inspect(move |item| {
+                let _ = seen_tx.send(item.data.as_ref().and_then(|d| d.engine_data.clone()));
+            });
+        let prefill = ResponseStream::new(Box::pin(stream), Arc::new(Controller::default()));
+        let tracker = Arc::new(RequestTracker::new());
+        let PrefillCompletion::Handoff {
+            completion: Some(completion),
+            ..
+        } = PrefillRouter::consume_prefill_stream(prefill, Some(tracker.clone()), None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a bootstrap handoff");
+        };
+        assert_eq!(seen_rx.recv().await, Some(None));
+
+        let context = Arc::new(Controller::default());
+        let decode: ManyOut<Annotated<LLMEngineOutput>> = ResponseStream::new(
+            Box::pin(stream::iter([Annotated::from_data(
+                LLMEngineOutput::length(),
+            )])),
+            context.clone(),
+        );
+        let response = completion
+            .forward_decode(
+                async { Ok(decode) },
+                context.clone(),
+                PrefillNeed::None,
+                Arc::new(Controller::default()),
+            )
+            .await
+            .unwrap();
+        let outputs = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            response.collect::<Vec<_>>(),
+        )
+        .await
+        .expect("response waited for prefill completion");
+        assert_eq!(outputs.len(), 1);
+        assert!(seen_rx.try_recv().is_err());
+
+        release_tx.send(()).unwrap();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(1), seen_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(seen, Some(Some(kv_cache_hit)));
+        // The sender is dropped only when the detached task has drained the stream.
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), seen_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(eof, None);
+        assert!(!tracker.record_prefill_complete());
+        assert!(!context.is_stopped());
+    }
+
     #[tokio::test]
     async fn bootstrap_drain_retains_teardown_guard_until_stream_finishes() {
         let first = Annotated::from_data(LLMEngineOutput {
