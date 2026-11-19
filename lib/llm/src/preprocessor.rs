@@ -6198,6 +6198,16 @@ impl OpenAIPreprocessor {
         })
     }
 
+    /// `DYN_END_STREAM_ON_FINISH=1`: a single-choice response ends (usage, then `[DONE]`) right after the chunk
+    /// that carries its finish_reason, instead of after the worker closes its stream; the rest of the backend
+    /// stream is drained off the response path.
+    fn end_stream_on_finish_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("DYN_END_STREAM_ON_FINISH").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+    }
+
     pub fn transform_postprocessor_stream<S, Resp>(
         stream: S,
         generator: Box<dyn DeltaGeneratorExt<Resp>>,
@@ -6220,6 +6230,7 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata,
             mm_counts,
             None,
+            false,
         )
     }
 
@@ -6234,6 +6245,7 @@ impl OpenAIPreprocessor {
         trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
         mm_counts: MultimodalCounts,
         image_tokens: Option<usize>,
+        end_on_finish: bool,
     ) -> impl Stream<Item = Annotated<Resp>> + Send
     where
         S: Stream<Item = Annotated<BackendOutput>> + Send + Unpin + 'static,
@@ -6266,7 +6278,8 @@ impl OpenAIPreprocessor {
         where
             Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
         {
-            response_stream: S,
+            /// `None` once handed to a detached drain (end_on_finish).
+            response_stream: Option<S>,
             response_generator: Box<dyn DeltaGeneratorExt<Resp>>,
             detokenize_metrics: DetokenizeMetricsGuard,
             context: Arc<dyn AsyncEngineContext>,
@@ -6283,11 +6296,12 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata: Option<crate::request_trace::SharedFinishReasonMetadata>,
             mm_counts: MultimodalCounts,
             image_tokens: Option<usize>,
+            end_on_finish: bool,
         }
 
         let tracker = generator.tracker();
         let state = State {
-            response_stream: stream,
+            response_stream: Some(stream),
             response_generator: generator,
             detokenize_metrics: DetokenizeMetricsGuard { tracker },
             context: context.clone(),
@@ -6302,6 +6316,7 @@ impl OpenAIPreprocessor {
             trace_finish_reason_metadata,
             mm_counts,
             image_tokens,
+            end_on_finish,
         };
 
         /// The response stream. `state` is `None` once the stream has ended, so the state,
@@ -6322,7 +6337,7 @@ impl OpenAIPreprocessor {
 
         impl<S, Resp> Stream for Postprocessed<S, Resp>
         where
-            S: Stream<Item = Annotated<BackendOutput>> + Unpin,
+            S: Stream<Item = Annotated<BackendOutput>> + Send + Unpin + 'static,
             Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
         {
             type Item = Annotated<Resp>;
@@ -6345,7 +6360,7 @@ impl OpenAIPreprocessor {
 
         impl<S, Resp> State<S, Resp>
         where
-            S: Stream<Item = Annotated<BackendOutput>> + Unpin,
+            S: Stream<Item = Annotated<BackendOutput>> + Send + Unpin + 'static,
             Resp: Send + Sync + Clone + 'static + std::fmt::Debug,
         {
             /// The next chunk of the response, or `None` when it has ended.
@@ -6371,7 +6386,17 @@ impl OpenAIPreprocessor {
                     return Poll::Ready(None);
                 }
 
-                if let Some(mut response) = ready!(self.response_stream.poll_next_unpin(cx)) {
+                // Single choice finished: end now and let the backend's close happen off this path.
+                if self.end_on_finish && self.finish_reason_sent && !self.cancelled {
+                    if let Some(rest) = self.response_stream.take() {
+                        tokio::spawn(rest.for_each(|_| async {}));
+                    }
+                }
+                let next = match self.response_stream.as_mut() {
+                    Some(stream) => ready!(stream.poll_next_unpin(cx)),
+                    None => None,
+                };
+                if let Some(mut response) = next {
                     // Split topology: overlay a standalone router's forwarded routing_data
                     // (timing, query-only token_ids) onto this request's tracker so the
                     // frontend's nvext/timing surfaces populate.
@@ -8780,6 +8805,7 @@ impl
             trace_finish_reason_metadata,
             mm_counts,
             image_tokens,
+            Self::end_stream_on_finish_enabled() && request.inner.n.unwrap_or(1) == 1,
         );
 
         let transformed_stream = self.postprocessor_parsing_stream_with_constraint(
@@ -8998,6 +9024,7 @@ impl
             trace_finish_reason_metadata,
             MultimodalCounts::default(),
             None,
+            false,
         );
 
         let stream =
