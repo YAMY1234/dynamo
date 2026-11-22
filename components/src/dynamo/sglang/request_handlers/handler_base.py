@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -45,6 +46,11 @@ from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.cancellation import CancellationMixin
 
 logger = logging.getLogger(__name__)
+
+# Check plain-int token lists with C-level builtins; the per-token loop below only
+# runs to produce the error message (agentic prompts reach 100K+ tokens per request).
+_FAST_TOKEN_VALIDATION = os.environ.get("DYN_SGL_FAST_TOKEN_VALIDATION", "0") == "1"
+_INT_TYPES = {int}
 
 
 _DEFAULT_NATIVE_ENGINE_ROUTES = (
@@ -604,6 +610,10 @@ class BaseWorkerHandler(
 
         if engine is not None:
             self._max_input_token_id = self._resolve_max_input_token_id(engine)
+            if _FAST_TOKEN_VALIDATION:
+                logger.info(
+                    "DYN_SGL_FAST_TOKEN_VALIDATION: token IDs checked with builtins"
+                )
             self.input_param_manager = InputParamManager(
                 self.engine.tokenizer_manager.tokenizer
                 if self.use_sglang_tokenizer
@@ -1074,6 +1084,14 @@ class BaseWorkerHandler(
             prompt_label = f"{label}[{prompt_index}]" if batched else label
             if not isinstance(prompt_ids, list):
                 raise HttpError(400, f"{prompt_label} must be a token ID list")
+            if (
+                _FAST_TOKEN_VALIDATION
+                and prompt_ids
+                and set(map(type, prompt_ids)) == _INT_TYPES
+                and min(prompt_ids) >= 0
+                and (max_input_token_id is None or max(prompt_ids) <= max_input_token_id)
+            ):
+                continue
             for index, token_id in enumerate(prompt_ids):
                 if isinstance(token_id, bool) or not isinstance(token_id, int):
                     raise HttpError(
